@@ -49,7 +49,10 @@ The table shows the mean over 4 seeds.
    - Tumor and age had not moved with any other change. They track training length in the 40-epoch run, and Muon learns more per step: the epoch-4 loss is .287 against .469 for AdamW.
    - It runs at ~172 vol/s against ~208 for AdamW (torch's Muon steps each matrix in a Python loop), so only 12 epochs fit in the hour, and it still wins.
 
-**In progress:** `a17/muon-lr2x`, with Muon's learning rate doubled and AdamW unchanged (`muon_lr_mult=2`).
+5. **Doubling Muon's learning rate is negative** (`a17/muon-lr2x`, `muon_lr_mult=2`, AdamW unchanged).
+   - It loses on every task: tumor −.025 (0/4), age −.018 (0/4), hippocampus −.045.
+   - It learns faster up to epoch ~8, then the loss rises and the grad norm climbs (.16 → .35). The seeds that fit 13 epochs lost the most.
+   - 1× stays.
 
 ## All arms, paired by seed
 
@@ -81,6 +84,8 @@ The reference is in the `vs` column. Cells are the mean difference (seeds better
 | `n8/lr3e-3-cut40` cls-l12 | `n8/lr3e-3-cut40` l12 | 4 | – | – | – | – | +0.000 (3/4) | – | – | +0.036 (3/4) |
 | `a17/muon` l12 | `n8/lr3e-3-cut40` l12 | 4 | +0.072 (4/4) | -0.001 (2/4) | +0.028 (4/4) | -0.024 (1/4) | +0.044 (4/4) | +0.002 (4/4) | +0.002 (4/4) | +0.087 (4/4) |
 | `a17/muon` cat9-12 | `n8/lr3e-3-cut40` cat9-12 | 4 | +0.068 (4/4) | +0.003 (3/4) | +0.024 (4/4) | -0.011 (2/4) | +0.045 (4/4) | +0.003 (4/4) | -0.000 (2/4) | +0.055 (3/4) |
+| `a17/muon-lr2x` l12 | `a17/muon` l12 | 4 | -0.045 (1/4) | -0.006 (1/4) | -0.025 (0/4) | -0.007 (2/4) | -0.018 (0/4) | -0.004 (1/4) | -0.001 (1/4) | -0.022 (1/4) |
+| `a17/muon-lr2x` cat9-12 | `a17/muon` cat9-12 | 4 | -0.042 (1/4) | -0.006 (1/4) | -0.032 (0/4) | -0.009 (1/4) | -0.028 (0/4) | -0.003 (1/4) | -0.001 (1/4) | -0.004 (2/4) |
 
 ## Code
 
