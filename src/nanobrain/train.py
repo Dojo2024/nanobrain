@@ -1,4 +1,5 @@
 import argparse
+import collections
 import datetime
 import itertools
 import json
@@ -15,7 +16,7 @@ import wandb
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader, Sampler, default_collate
 from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
@@ -67,10 +68,15 @@ def main(args: DictConfig):
     # data loader
     dataset = BrainNpzDataset(args.data_root, args.train_filelist)
     logger.info(f"train dataset: {len(dataset)} images")
+    if args.modality_power is not None:
+        sampler = ModalitySampler(dataset.paths, args.modality_power)
+    else:
+        sampler = None
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=list,  # no collate, variable shapes. lambda can't be pickled to workers
         pin_memory=True,
@@ -344,6 +350,47 @@ def train_one_epoch(
 
     logger.info(f"Averaged stats: {metric_logger}")
     return {f"train/{k}": meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+class ModalitySampler(Sampler):
+    """Each epoch draws len(paths) images: scan type m gets a quota proportional to its image
+    count ** power, filled by cycling through shuffled orders of that type's images, so repeats
+    are as even as possible. power 1 gives every image once per epoch, like shuffle; power 0 is
+    uniform over types. The scan type is the last _ token of the file name, e.g.
+    sub-01_ses-01_T1w.npz -> T1w."""
+
+    def __init__(self, paths: Sequence[str], power: float):
+        self.indices = collections.defaultdict(list)
+        for index, path in enumerate(paths):
+            self.indices[Path(path).stem.rsplit("_", 1)[-1]].append(index)
+        total = sum(len(indices) ** power for indices in self.indices.values())
+        self.quotas = {
+            modality: round(len(paths) * len(indices) ** power / total)
+            for modality, indices in self.indices.items()
+        }
+        # one epoch stays len(paths) samples, so the lr schedule is unchanged
+        largest = max(self.quotas, key=self.quotas.get)
+        self.quotas[largest] += len(paths) - sum(self.quotas.values())
+        self.num_samples = len(paths)
+        for modality, quota in sorted(self.quotas.items(), key=lambda item: -item[1]):
+            count = len(self.indices[modality])
+            logger.info(
+                f"modality {modality}: {count} images ({count / len(paths):.1%}), "
+                f"{quota} samples per epoch ({quota / len(paths):.1%}, {quota / count:.2f}x each)"
+            )
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self):
+        samples = []
+        for modality, quota in self.quotas.items():
+            indices = torch.tensor(self.indices[modality])
+            repeats = math.ceil(quota / len(indices))
+            orders = [indices[torch.randperm(len(indices))] for _ in range(repeats)]
+            samples.append(torch.cat(orders)[:quota])
+        samples = torch.cat(samples)
+        yield from samples[torch.randperm(len(samples))].tolist()
 
 
 def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:

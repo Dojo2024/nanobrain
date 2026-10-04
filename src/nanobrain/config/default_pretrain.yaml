@@ -11,6 +11,10 @@ output_dir: output
 data_root: data/FOMO300K_images
 train_filelist: data/FOMO300K_images/filelist_subsampled.txt
 num_workers: 8
+# Sample scan types (the file name's last _ token, e.g. T1w) with probability proportional to
+# image count ** modality_power, uniform within a type. null samples images uniformly; 0.5 is
+# square-root sampling, which moves T1w from 66% to 42% of samples on filelist_subsampled.txt.
+modality_power: null
 prefetch_factor: 2
 
 # Fixed 1mm grid that all images are fit to.
