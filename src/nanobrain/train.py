@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import itertools
 import json
 import logging
 import math
@@ -19,7 +20,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
 from nanobrain.data import BrainNpzDataset, process_sample
-from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.model import ViTMAE3D, make_mask_groups, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
@@ -106,18 +107,29 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    param_groups = misc.get_param_groups(model)
+    assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
+    param_groups = misc.get_param_groups(
+        model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
+    )
     misc.update_lr(param_groups, args.lr)
     misc.update_wd(param_groups, args.weight_decay)
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    else:
+        assert args.optimizer == "muon", args.optimizer
+        optimizer = misc.MuonAdamW(param_groups, betas=betas, fused=args.fused_adamw)
+        num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
+        num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
+        logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M")
 
     epoch_num_batches = len(train_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = args.warmup_epochs * steps_per_epoch
-    lr_schedule = misc.WarmupThenCosine(
+    schedule_class = {"cosine": misc.WarmupThenCosine, "linear": misc.WarmupThenLinear}
+    lr_schedule = schedule_class[args.lr_decay](
         base_value=args.lr,
         final_value=args.min_lr,
         total_iters=total_steps,
@@ -125,19 +137,33 @@ def main(args: DictConfig):
     )
     logger.info(f"full schedule: epochs = {args.epochs} (steps = {total_steps})")
     logger.info(f"warmup: epochs = {args.warmup_epochs} (steps = {warmup_steps})")
+    logger.info(f"lr decay: {args.lr_decay}")
+    if args.time_budget:
+        logger.info(
+            f"time budget: {args.time_budget} s spans the {total_steps} step schedule, "
+            "training stops at the budget"
+        )
 
     # loss scaling not needed for bfloat16 (according to timm)
     if args.amp and args.amp_dtype != "bfloat16":
         loss_scaler = torch.GradScaler(device.type)
     else:
         loss_scaler = None
+    assert loss_scaler is None or args.optimizer == "adamw", "muon has no GradScaler support"
 
     # load checkpoint/resume training
     misc.load_model(args, model, optimizer, loss_scaler)
+    # elapsed time restarts on resume, which would replay the schedule
+    assert not (args.time_budget and args.start_epoch), "a time budget run can't resume"
 
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
-    for epoch in range(args.start_epoch, args.epochs):
+    # with a time budget, epochs run until the budget runs out
+    if args.time_budget:
+        epochs = itertools.count(args.start_epoch)
+    else:
+        epochs = range(args.start_epoch, args.epochs)
+    for epoch in epochs:
         train_stats = train_one_epoch(
             args,
             model,
@@ -148,6 +174,8 @@ def main(args: DictConfig):
             epoch,
             device,
             batch_flops,
+            start_time,
+            total_steps,
         )
 
         merged_stats = {"epoch": epoch, **train_stats}
@@ -155,6 +183,8 @@ def main(args: DictConfig):
             print(json.dumps(merged_stats), file=f)
 
         misc.save_model(args, epoch, model, optimizer, loss_scaler)
+        if args.time_budget and time.monotonic() - start_time >= args.time_budget:
+            break
 
     total_time = time.monotonic() - start_time
     logger.info(f"done! training time: {datetime.timedelta(seconds=int(total_time))}")
@@ -170,8 +200,15 @@ def train_one_epoch(
     epoch: int,
     device: torch.device,
     batch_flops: float,
+    start_time: float,
+    total_steps: int,
 ):
     model.train()
+    if args.mask_groups:
+        patch_grid_size = [size // args.patch_size for size in args.grid_size]
+        mask_groups = make_mask_groups(patch_grid_size, args.mask_groups).to(device)
+    else:
+        mask_groups = None
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -211,7 +248,13 @@ def train_one_epoch(
         group_size = min(args.accum_iter, num_batches - update_in_epoch * args.accum_iter)
         need_update = batch_step % args.accum_iter == 0 or batch_step == num_batches
         global_step = epoch * steps_per_epoch + update_in_epoch
-        lr = lr_schedule[global_step]
+        if args.time_budget:
+            # key the schedule to elapsed wall time, so it finishes decaying at the budget
+            elapsed = time.monotonic() - start_time
+            schedule_step = min(int(elapsed / args.time_budget * total_steps), total_steps)
+        else:
+            schedule_step = global_step
+        lr = lr_schedule[schedule_step]
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -231,6 +274,7 @@ def train_one_epoch(
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
+                mask_groups=mask_groups,
             )
 
         loss_for_log = loss.detach()
@@ -266,6 +310,11 @@ def train_one_epoch(
                 step=int(1000 * (epoch + batch_step / epoch_num_batches)),
             )
 
+        # stop after an optimizer step, so the saved checkpoint has no pending gradients
+        if need_update and args.time_budget and time.monotonic() - start_time >= args.time_budget:
+            logger.info(f"time budget reached at step {batch_step}/{num_batches} of epoch {epoch}")
+            break
+
     # plot a few images from the last batch
     num_examples = args.plot_nrow * args.plot_ncol
     is_plot_epoch = args.plot_period and (epoch % args.plot_period == 0 or epoch == args.epochs - 1)
@@ -283,6 +332,7 @@ def train_one_epoch(
                 num_visible=args.num_visible,
                 num_predict=args.plot_num_predict,
                 num_samples=1,
+                mask_groups=mask_groups,
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)

@@ -390,6 +390,33 @@ class WarmupThenCosine:
         return float(self.schedule[it])
 
 
+class WarmupThenLinear:
+    """WarmupThenCosine with a linear decay from base_value to final_value."""
+
+    def __init__(
+        self,
+        base_value: float,
+        final_value: float,
+        total_iters: int,
+        warmup_iters: int = 0,
+        start_warmup_value: float = 0.0,
+    ):
+        super().__init__()
+        self.final_value = final_value
+        self.total_iters = total_iters
+
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+        schedule = np.linspace(base_value, final_value, total_iters - warmup_iters)
+        self.schedule = np.concatenate((warmup_schedule, schedule))
+        assert len(self.schedule) == self.total_iters
+
+    def __getitem__(self, it: int) -> float:
+        if it >= self.total_iters:
+            return self.final_value
+        # cast to float or else it can corrupt the checkpoint
+        return float(self.schedule[it])
+
+
 # adapted from timm backward logic
 # https://github.com/huggingface/pytorch-image-models/blob/main/timm/utils/cuda.py
 def backward_step(
@@ -433,7 +460,13 @@ def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
 
 
 # from dinov2 with some minor changes
-def get_param_groups(model, patch_embed_lr_mult=1.0):
+# Hidden weight matrices that Muon updates: attention and mlp weights in the encoder and decoder
+# blocks, and the encoder to decoder projection. The patch embedding, position embeddings, tokens
+# and decoder head stay on AdamW, as in Moonshot's recipe.
+MUON_PREFIXES = ("blocks.", "decoder_blocks.", "decoder_proj.")
+
+
+def get_param_groups(model, patch_embed_lr_mult=1.0, muon=False, muon_lr_mult=1.0):
     # no lr decay, we could add this later if needed
     all_params = []
 
@@ -447,6 +480,11 @@ def get_param_groups(model, patch_embed_lr_mult=1.0):
 
         if "patch_embed" in name:
             d["lr_multiplier"] = d["lr_multiplier"] * patch_embed_lr_mult
+
+        if muon:
+            d["muon"] = param.ndim == 2 and name.startswith(MUON_PREFIXES)
+            if d["muon"]:
+                d["lr_multiplier"] = d["lr_multiplier"] * muon_lr_mult
 
         all_params.append(d)
 
@@ -465,6 +503,39 @@ def _fuse_param_groups(all_param_groups):
 
     param_groups = list(fused_param_groups.values())
     return param_groups
+
+
+class MuonAdamW:
+    """Muon for the param groups flagged muon, AdamW for the rest, stepped as one optimizer.
+
+    Muon's update is rescaled to AdamW's rms (adjust_lr_fn match_rms_adamw, Moonshot, 2502.16982),
+    so both share the lr and weight decay schedule. param_groups lists both optimizers' groups, so
+    update_lr, update_wd and clip_grad cover every parameter. No GradScaler support.
+    """
+
+    def __init__(self, param_groups, betas=None, fused=None):
+        self.muon = torch.optim.Muon(
+            [g for g in param_groups if g["muon"]], adjust_lr_fn="match_rms_adamw"
+        )
+        self.adamw = torch.optim.AdamW(
+            [g for g in param_groups if not g["muon"]], betas=betas, fused=fused
+        )
+        self.param_groups = self.muon.param_groups + self.adamw.param_groups
+
+    def step(self):
+        self.muon.step()
+        self.adamw.step()
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.muon.zero_grad(set_to_none)
+        self.adamw.zero_grad(set_to_none)
+
+    def state_dict(self):
+        return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self.muon.load_state_dict(state_dict["muon"])
+        self.adamw.load_state_dict(state_dict["adamw"])
 
 
 def update_lr(param_groups, lr: float):

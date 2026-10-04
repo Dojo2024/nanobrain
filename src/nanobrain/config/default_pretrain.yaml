@@ -23,6 +23,11 @@ patch_size: 8
 num_visible: 1280
 num_predict: 1280
 num_samples: 2
+# Structured masking, or null for random patches. A list of group shapes [gx, gy, gz] in
+# patches; each sequence picks one shape and shuffles whole groups, so a group's patches are
+# seen or hidden together. Axes are RAS: 0 left-right, 1 back-front, 2 bottom-top.
+# [[1, 1, 30]] = full tubes along bottom-top (axial), [[4, 4, 4]] = 32 mm blocks.
+mask_groups: null
 
 # Model (ViT-S encoder).
 model_kwargs:
@@ -44,7 +49,18 @@ base_lr: 0.001
 lr: null
 min_lr: 1e-6
 warmup_epochs: 5
+# Decay after warmup: cosine or linear.
+lr_decay: cosine
+# Seconds of training, or null. If set, the lr schedule is keyed to elapsed wall time instead of
+# steps: the budget spans the epochs * steps_per_epoch schedule, so the lr finishes decaying when
+# the budget runs out, and training stops there. epochs is then the expected number of epochs.
+time_budget: null
 weight_decay: 0.05
+# adamw, or muon: Muon for the hidden weight matrices (misc.MUON_PREFIXES) and AdamW for the
+# rest, with Muon's update matched to AdamW's rms so both use lr and weight_decay as is.
+optimizer: adamw
+# Scales the lr of the Muon params only (optimizer muon); AdamW params keep lr.
+muon_lr_mult: 1.0
 betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true

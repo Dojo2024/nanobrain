@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -153,6 +155,7 @@ class ViTMAE3D(nn.Module):
         num_predict: int | None = None,
         num_samples: int = 1,
         with_state: bool = True,
+        mask_groups: Int[Tensor, "K N"] | None = None,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -164,7 +167,7 @@ class ViTMAE3D(nn.Module):
         # sample num_samples sequences per image, then flatten them into the batch
         # num_predict None predicts all remaining patches (dense decoding)
         seq_length = None if num_predict is None else num_visible + num_predict
-        order = sample_sequences(mask_patches, num_samples, seq_length)
+        order = sample_sequences(mask_patches, num_samples, seq_length, mask_groups=mask_groups)
         num_predict = order.shape[2] - num_visible
         batch_ids = torch.arange(B, device=images.device)[:, None, None]
         patches = patches[batch_ids, order].flatten(0, 1)
@@ -289,17 +292,48 @@ def make_coord_grid(
     return coords
 
 
+def make_mask_groups(
+    patch_grid_size: tuple[int, int, int],
+    group_shapes: list[list[int]],
+) -> Int[Tensor, "K N"]:
+    """Group id of every patch for each group shape [gx, gy, gz] in patches. Patches in one
+    group are seen or hidden together: [1, 1, 30] is a full tube along the last axis, [4, 4, 4]
+    a block of 4^3 patches."""
+    grid = torch.stack(
+        torch.meshgrid(*[torch.arange(size) for size in patch_grid_size], indexing="ij"), dim=-1
+    ).reshape(-1, 3)
+    group_ids = []
+    for shape in group_shapes:
+        shape = torch.tensor(list(shape))
+        num_groups = [math.ceil(size / s) for size, s in zip(patch_grid_size, shape.tolist())]
+        block = grid // shape
+        group_ids.append((block[:, 0] * num_groups[1] + block[:, 1]) * num_groups[2] + block[:, 2])
+    return torch.stack(group_ids)
+
+
 def sample_sequences(
     mask_patches: torch.Tensor,
     num_samples: int,
     seq_length: int | None = None,
     min_mask_frac: float = 0.25,
+    mask_groups: Int[Tensor, "K N"] | None = None,
 ) -> torch.Tensor:
     batch_size, num_patches, _ = mask_patches.shape
     mask_frac = mask_patches.mean(dim=2)
     # one independent shuffle per sequence, with patches outside the mask sorted last so
     # they are only used when a volume has too few mask patches
     scores = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    if mask_groups is not None:
+        # structured masks: each sequence picks one of the K groupings, then shuffles whole
+        # groups, so a group's patches are contiguous in the order (seen or hidden together).
+        # group ids are < num_patches, so a random permutation of num_patches ranks the groups
+        choice = torch.randint(
+            len(mask_groups), (batch_size, num_samples), device=mask_patches.device
+        )
+        group_ids = mask_groups[choice]
+        group_rank = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+        group_rank = group_rank.argsort(dim=2).gather(2, group_ids)
+        scores = (group_rank + scores) / num_patches
     scores = torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
     if seq_length is None:
         # one host sync to get the longest mask sequence in the batch
