@@ -161,6 +161,9 @@ def main(args: DictConfig):
     misc.load_model(args, model, optimizer, loss_scaler)
     # elapsed time restarts on resume, which would replay the schedule
     assert not (args.time_budget and args.start_epoch), "a time budget run can't resume"
+    # the EMA copies are not saved for resuming
+    assert not (args.ema_decays and args.start_epoch), "an ema run can't resume"
+    ema = misc.ModelEMA(model, args.ema_decays) if args.ema_decays else None
 
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
@@ -182,6 +185,7 @@ def main(args: DictConfig):
             batch_flops,
             start_time,
             total_steps,
+            ema,
         )
 
         merged_stats = {"epoch": epoch, **train_stats}
@@ -189,6 +193,8 @@ def main(args: DictConfig):
             print(json.dumps(merged_stats), file=f)
 
         misc.save_model(args, epoch, model, optimizer, loss_scaler)
+        if ema is not None:
+            misc.save_ema(args, epoch, model, ema)
         if args.time_budget and time.monotonic() - start_time >= args.time_budget:
             break
 
@@ -208,6 +214,7 @@ def train_one_epoch(
     batch_flops: float,
     start_time: float,
     total_steps: int,
+    ema: misc.ModelEMA | None = None,
 ):
     model.train()
     if args.mask_groups:
@@ -293,6 +300,9 @@ def train_one_epoch(
             need_update=need_update,
             max_norm=args.clip_grad,
         )
+
+        if need_update and ema is not None:
+            ema.update()
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)

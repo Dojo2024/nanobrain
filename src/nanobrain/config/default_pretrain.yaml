@@ -73,6 +73,11 @@ amp: true
 amp_dtype: bfloat16
 compile: true
 
+# EMA copies of the weights for evaluation, a list of decays, or null. Each is updated after every
+# optimizer step and saved each epoch as checkpoint-ema<decay>.pth, a model-only checkpoint the
+# eval loads as is. Not resumable.
+ema_decays: null
+
 # Checkpointing.
 ckpt: null
 resume: false

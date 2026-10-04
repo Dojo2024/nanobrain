@@ -331,6 +331,53 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler):
             checkpoint_path.unlink()
 
 
+class ModelEMA:
+    """Exponential moving averages of a model's parameters, one copy per decay, for evaluation
+    only. update() after each optimizer step; the decay warms up as min(decay, (1 + t) / (10 + t))
+    at update t, so the random init washes out early."""
+
+    def __init__(self, model: nn.Module, decays: list[float]):
+        self.decays = list(decays)
+        self.names, self.params = zip(*model.named_parameters())
+        self.copies = [[p.detach().clone() for p in self.params] for _ in self.decays]
+        self.num_updates = 0
+
+    @torch.no_grad()
+    def update(self):
+        self.num_updates += 1
+        t = self.num_updates
+        for decay, copy in zip(self.decays, self.copies):
+            weight = 1 - min(decay, (1 + t) / (10 + t))
+            torch._foreach_lerp_(copy, self.params, weight)
+
+    def state_dict(self, model: nn.Module, index: int) -> dict:
+        """model.state_dict() with the parameters replaced by EMA copy `index`."""
+        state = model.state_dict()
+        for name, param in zip(self.names, self.copies[index]):
+            assert state[name].shape == param.shape, name
+            state[name] = param.detach().clone()
+        return state
+
+
+def save_ema(args, epoch, model_without_ddp, ema: ModelEMA):
+    """Save each EMA copy as checkpoint-ema<decay>.pth, a model-only checkpoint in the format the
+    eval loads."""
+    output_dir = Path(args.output_dir)
+    for index, decay in enumerate(ema.decays):
+        path = output_dir / f"checkpoint-ema{decay:g}.pth"
+        to_save = {
+            "model": ema.state_dict(model_without_ddp, index),
+            "epoch": epoch,
+            "ema_decay": decay,
+            "ema_updates": ema.num_updates,
+            "args": OmegaConf.to_container(args),
+            "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
+            "git_sha": git_sha(),
+        }
+        logger.info(f"saving checkpoint {path}")
+        save_on_master(to_save, path)
+
+
 def load_model(args, model_without_ddp, optimizer, loss_scaler):
     auto_resume = getattr(args, "auto_resume", True)
     output_dir = Path(args.output_dir)

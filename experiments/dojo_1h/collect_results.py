@@ -64,6 +64,8 @@ def main():
 
         readout_dirs = [("l12", seed_dir / "eval")]
         readout_dirs += [(d.name, d) for d in sorted((seed_dir / "readout").glob("*")) if d.is_dir()]
+        # EMA checkpoints (ema_decays) are scored on the last layer, eval-ema<decay> -> ema<decay>-l12
+        readout_dirs += [(f"{d.name[len('eval-'):]}-l12", d) for d in sorted(seed_dir.glob("eval-ema*"))]
         for readout, result_dir in readout_dirs:
             readout = RENAMED_READOUTS.get((run, readout), readout)
             for task in DEFAULT_TASKS:

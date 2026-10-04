@@ -15,7 +15,7 @@
 
 # One seed of an ablation arm under the 1 h wall time budget, same flow as baseline_1hr.sbatch
 # plus extra config overrides, then the default nanobrain eval on checkpoint-last, then the same
-# eval on the layers 9+12 readout (readout/cat9-12).
+# eval on the layers 9+12 readout (readout/cat9-12), then the eval on each EMA checkpoint (eval-ema*).
 # usage: sbatch -J <job name> scripts/arm_1hr.sbatch <run name> <seed> [overrides...]
 #   e.g. sbatch -J n7 scripts/arm_1hr.sbatch n7/cos14 7338 epochs=14 warmup_epochs=1
 #
@@ -78,3 +78,13 @@ for task in $(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASK
     fi
 done
 rm "${READOUT_DIR}/model.pth"
+
+# EMA checkpoints (ema_decays), last layer only, ~6 min each, into eval-ema<decay>
+for ckpt in "${RUN_DIR}"/checkpoint-ema*.pth; do
+    [[ -e "${ckpt}" ]] || continue
+    name="$(basename "${ckpt}" .pth)"
+    name="${name#checkpoint-}"
+    if ! .venv/bin/python -m nanobrain.eval.run "${ckpt}" "${RUN_DIR}/eval-${name}"; then
+        echo "FAILED eval ${name}" | tee -a "${RUN_DIR}/readout/failed.txt"
+    fi
+done
