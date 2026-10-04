@@ -156,6 +156,7 @@ class ViTMAE3D(nn.Module):
         num_samples: int = 1,
         with_state: bool = True,
         mask_groups: Int[Tensor, "K N"] | None = None,
+        norm_target: bool = False,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -179,6 +180,14 @@ class ViTMAE3D(nn.Module):
             mask_patches, [num_visible, num_predict], dim=1
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
+
+        if norm_target:
+            # MAE's norm_pix_loss: each target patch standardized by the mean and variance of its
+            # in-mask voxels, so the loss is on local structure rather than intensity level
+            count = target_mask_patches.sum(dim=-1, keepdim=True).clamp_min(1)
+            mean = (target_mask_patches * target_patches).sum(dim=-1, keepdim=True) / count
+            var = (target_mask_patches * (target_patches - mean) ** 2).sum(dim=-1, keepdim=True) / count
+            target_patches = (target_patches - mean) / (var + 1e-6).sqrt()
 
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)

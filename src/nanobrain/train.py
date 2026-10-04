@@ -288,6 +288,7 @@ def train_one_epoch(
                 num_samples=args.num_samples,
                 with_state=False,
                 mask_groups=mask_groups,
+                norm_target=args.norm_target,
             )
 
         loss_for_log = loss.detach()
@@ -349,6 +350,7 @@ def train_one_epoch(
                 num_predict=args.plot_num_predict,
                 num_samples=1,
                 mask_groups=mask_groups,
+                norm_target=args.norm_target,
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)

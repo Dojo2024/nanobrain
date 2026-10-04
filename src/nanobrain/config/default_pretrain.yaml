@@ -32,6 +32,9 @@ num_samples: 2
 # seen or hidden together. Axes are RAS: 0 left-right, 1 back-front, 2 bottom-top.
 # [[1, 1, 30]] = full tubes along bottom-top (axial), [[4, 4, 4]] = 32 mm blocks.
 mask_groups: null
+# Standardize each target patch by its in-mask mean and variance (MAE's norm_pix_loss), so the
+# loss is on local structure rather than intensity level.
+norm_target: false
 
 # Model (ViT-S encoder).
 model_kwargs:
