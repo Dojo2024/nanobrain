@@ -66,9 +66,8 @@ run_readout() {
 # 2026-10-03 sweep on baseline/s*: l12 (control), l3, l6, l9, mean3-6-9-12, cat9-12 (layers 9-12),
 # cat3-6-9-12, cls-l12. Results in nanobrain-ideas.md section 0.10.
 
-# N1, narrow concat: two layers, 768 wide, compared to ${RUN_DIR}/eval
-run_readout cat6-12 "" --layers 6 12
-run_readout cat9-12 "" --layers 9 12
-# N3, class token + patch mean, only changes the global embedding
-run_readout cls-l12 "fomo_task3_t1w_age fomo_task5_t1w_pmg" --layers 12 --global-cls
+# 2026-10-04 on n8/lr3e-3-cut40/s*: cat6-12, cat9-12 (layers 9 and 12), cls-l12 (N1 and N3).
+
+# three layers, 1152 wide, compared to ${RUN_DIR}/readout/cat9-12 and ${RUN_DIR}/eval
+run_readout cat6-9-12 "" --layers 6 9 12
 echo "[$(date +%T)] done"
