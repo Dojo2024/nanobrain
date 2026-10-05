@@ -7,6 +7,10 @@ a17/muon-lr2x,1,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""muon_lr_mult"":
 a17/muon-lr2x,2,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""muon_lr_mult"": 2}",13,0.1667,180
 a17/muon-lr2x,3,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""muon_lr_mult"": 2}",13,0.168,181
 a17/muon-lr2x,7338,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""muon_lr_mult"": 2}",11,0.1499,164
+a3/normtarget,1,"{""norm_target"": true, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.3992,175
+a3/normtarget,2,"{""norm_target"": true, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.3966,176
+a3/normtarget,3,"{""norm_target"": true, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.3927,176
+a3/normtarget,7338,"{""norm_target"": true, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.3909,177
 b1/block4,1,"{""mask_groups"": [[4, 4, 4]], ""base_lr"": 0.003}",15,0.3017,205
 b1/block4,2,"{""mask_groups"": [[4, 4, 4]], ""base_lr"": 0.003}",15,0.3,208
 b1/block4,3,"{""mask_groups"": [[4, 4, 4]], ""base_lr"": 0.003}",15,0.2971,206
@@ -17,10 +21,22 @@ b2/tube-si-lr5e-3,1,"{""mask_groups"": [[1, 1, 30]], ""base_lr"": 0.005}",15,0.2
 b2/tube-si-lr5e-3,2,"{""mask_groups"": [[1, 1, 30]], ""base_lr"": 0.005}",15,0.2194,208
 b2/tube-si-lr5e-3,3,"{""mask_groups"": [[1, 1, 30]], ""base_lr"": 0.005}",15,0.2122,208
 b2/tube-si-lr5e-3,7338,"{""mask_groups"": [[1, 1, 30]], ""base_lr"": 0.005}",15,0.2193,206
+b26/sqrt,1,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",8,0.1579,127
+b26/sqrt,2,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",8,0.1585,133
+b26/sqrt,3,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",8,0.1575,129
+b26/sqrt,7338,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",8,0.1566,127
+b26/sqrt-r2,1,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.1381,178
+b26/sqrt-r2,2,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.1373,182
+b26/sqrt-r2,3,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.1369,183
+b26/sqrt-r2,7338,"{""modality_power"": 0.5, ""base_lr"": 0.003, ""optimizer"": ""muon""}",13,0.1374,181
 baseline,1,{},14,0.2537,203
 baseline,2,{},15,0.2388,206
 baseline,3,{},15,0.2385,204
 baseline,7338,{},15,0.2435,206
+n16/ema,1,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""ema_decays"": [0.999, 0.9995, 0.9998]}",13,0.1478,181
+n16/ema,2,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""ema_decays"": [0.999, 0.9995, 0.9998]}",6,0.2038,88
+n16/ema,3,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""ema_decays"": [0.999, 0.9995, 0.9998]}",12,0.151,170
+n16/ema,7338,"{""base_lr"": 0.003, ""optimizer"": ""muon"", ""ema_decays"": [0.999, 0.9995, 0.9998]}",13,0.1484,179
 n7/cos14,1,"{""epochs"": 14, ""warmup_epochs"": 1}",14,0.2549,207
 n7/cos14,2,"{""epochs"": 14, ""warmup_epochs"": 1}",14,0.2552,205
 n7/cos14,3,"{""epochs"": 14, ""warmup_epochs"": 1}",14,0.2473,207
