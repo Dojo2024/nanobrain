@@ -114,6 +114,7 @@ def main(args: DictConfig):
         logger.info(f"lr: {args.lr:.2e}")
 
     assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
+    assert args.optimizer == "muon" or args.muon_impl == "torch", "muon_impl needs optimizer muon"
     param_groups = misc.get_param_groups(
         model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
     )
@@ -125,7 +126,9 @@ def main(args: DictConfig):
         optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
     else:
         assert args.optimizer == "muon", args.optimizer
-        optimizer = misc.MuonAdamW(param_groups, betas=betas, fused=args.fused_adamw)
+        optimizer = misc.MuonAdamW(
+            param_groups, betas=betas, fused=args.fused_adamw, impl=args.muon_impl
+        )
         num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
         num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
         logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M")
