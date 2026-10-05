@@ -51,6 +51,9 @@ model_kwargs:
   drop_path_rate: 0.0
   # 2 extra decoder outputs per patch for its intensity mean and log std (see stats_weight)
   stats_head: false
+  # self: MAE decoder over visible + mask tokens. cross: mask tokens cross-attend to the visible
+  # embeddings only (CrossMAE), ~0.4x the decoder flops at 1280 visible / 1280 predicted.
+  decoder_type: self
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40

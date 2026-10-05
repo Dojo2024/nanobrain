@@ -27,8 +27,10 @@ class ViTMAE3D(nn.Module):
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
         stats_head: bool = False,
+        decoder_type: str = "self",
     ):
         super().__init__()
+        assert decoder_type in ("self", "cross"), decoder_type
         self.grid_size = grid_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -69,6 +71,10 @@ class ViTMAE3D(nn.Module):
         self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
         self.mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
 
+        # self: mask tokens and visible embeddings attend jointly, as in MAE. cross: mask tokens
+        # attend to the visible embeddings only, which stay fixed (CrossMAE), so the blocks run on
+        # the mask tokens alone and each prediction is independent of the other mask tokens.
+        self.decoder_type = decoder_type
         self.decoder_blocks = nn.ModuleList(
             [
                 Block(
@@ -140,12 +146,16 @@ class ViTMAE3D(nn.Module):
         mask_tokens = self.mask_token.expand(B, M, -1)
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
 
-        x = torch.cat([embeds, mask_tokens], dim=1)
+        if self.decoder_type == "cross":
+            x = mask_tokens
+            for block in self.decoder_blocks:
+                x = block(x, context=embeds)
+        else:
+            x = torch.cat([embeds, mask_tokens], dim=1)
+            for block in self.decoder_blocks:
+                x = block(x)
+            x = x[:, -M:]
 
-        for block in self.decoder_blocks:
-            x = block(x)
-
-        x = x[:, -M:]
         x = self.decoder_norm(x)
         x = self.decoder_head(x)
         return x
