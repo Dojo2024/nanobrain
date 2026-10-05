@@ -26,6 +26,7 @@ class ViTMAE3D(nn.Module):
         mlp_ratio: int | float = 4,
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
+        stats_head: bool = False,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -82,7 +83,9 @@ class ViTMAE3D(nn.Module):
         )
 
         self.decoder_norm = LayerNorm(decoder_embed_dim)
-        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+        # stats_head: 2 extra outputs per patch, its in-mask intensity mean and log std
+        self.stats_head = stats_head
+        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim + (2 if stats_head else 0))
         self.init_weights()
 
     @classmethod
@@ -157,6 +160,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         mask_groups: Int[Tensor, "K N"] | None = None,
         norm_target: bool = False,
+        stats_weight: float = 1.0,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -187,12 +191,22 @@ class ViTMAE3D(nn.Module):
             count = target_mask_patches.sum(dim=-1, keepdim=True).clamp_min(1)
             mean = (target_mask_patches * target_patches).sum(dim=-1, keepdim=True) / count
             var = (target_mask_patches * (target_patches - mean) ** 2).sum(dim=-1, keepdim=True) / count
+            target_stats = torch.cat([mean, 0.5 * torch.log(var + 1e-6)], dim=-1)
             target_patches = (target_patches - mean) / (var + 1e-6).sqrt()
+        assert norm_target or not self.stats_head, "stats_head needs norm_target"
 
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)
+        if self.stats_head:
+            pred_patches, pred_stats = pred_patches.split([pred_patches.shape[-1] - 2, 2], dim=-1)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
         loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
+        if self.stats_head:
+            # puts back the intensity level and spread that norm_target takes out of the target;
+            # patches with under 2 in-mask voxels have no spread
+            has_spread = (target_mask_patches.sum(dim=-1) > 1).to(loss.dtype)
+            stats_loss = ((pred_stats - target_stats) ** 2).mean(dim=-1)
+            loss = loss + stats_weight * (has_spread * stats_loss).sum() / has_spread.sum()
 
         if not with_state:
             return loss

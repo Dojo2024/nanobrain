@@ -35,6 +35,9 @@ mask_groups: null
 # Standardize each target patch by its in-mask mean and variance (MAE's norm_pix_loss), so the
 # loss is on local structure rather than intensity level.
 norm_target: false
+# Weight of the stats_head loss (model_kwargs.stats_head, needs norm_target): each predicted patch's
+# in-mask intensity mean and log std, the information norm_target takes out of the target.
+stats_weight: 1.0
 
 # Model (ViT-S encoder).
 model_kwargs:
@@ -46,6 +49,8 @@ model_kwargs:
   decoder_num_heads: 8
   class_tokens: 1
   drop_path_rate: 0.0
+  # 2 extra decoder outputs per patch for its intensity mean and log std (see stats_weight)
+  stats_head: false
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40

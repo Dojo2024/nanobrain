@@ -292,6 +292,7 @@ def train_one_epoch(
                 with_state=False,
                 mask_groups=mask_groups,
                 norm_target=args.norm_target,
+                stats_weight=args.stats_weight,
             )
 
         loss_for_log = loss.detach()
@@ -354,6 +355,7 @@ def train_one_epoch(
                 num_samples=1,
                 mask_groups=mask_groups,
                 norm_target=args.norm_target,
+                stats_weight=args.stats_weight,
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)
@@ -423,6 +425,8 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
+                norm_target=args.norm_target,
+                stats_weight=args.stats_weight,
             )
         loss.backward()
     model.zero_grad(set_to_none=True)
