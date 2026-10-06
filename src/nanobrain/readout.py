@@ -62,7 +62,8 @@ class ReadoutViTMAE3D(ViTMAE3D):
             x = block(x)
             if layer in layers:
                 # with hyper-connections a layer's output is the sum of its streams, as at the end
-                outputs.append(self.norm(x.sum(dim=2) if self.hc_rate else x))
+                dtype = self.norm.weight.dtype
+                outputs.append(self.norm(x.sum(dim=2, dtype=dtype) if self.hc_rate else x.to(dtype)))
             if layer == max(layers):
                 break
 

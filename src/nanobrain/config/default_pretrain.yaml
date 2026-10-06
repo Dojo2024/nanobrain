@@ -64,6 +64,9 @@ model_kwargs:
   # fc_dynamic: input-dependent mixing (DFC) on top of the static mixing (SFC).
   frac_connections: 0
   fc_dynamic: true
+  # Store the hyper-/frac-connection hidden state in bf16 between blocks (the frac-connections
+  # paper's code does), halving its memory traffic; the mixing is computed in fp32.
+  hc_bf16: false
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40

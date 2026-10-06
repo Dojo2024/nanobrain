@@ -38,6 +38,7 @@ class ViTMAE3D(nn.Module):
         hc_dynamic: bool = True,
         frac_connections: int = 0,
         fc_dynamic: bool = True,
+        hc_bf16: bool = False,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -65,14 +66,22 @@ class ViTMAE3D(nn.Module):
         # plain residual. The encoder then carries [B, N, rate, D] and sums the streams at the end.
         # frac_connections: number of fractions the hidden state is split into (Zhu et al., arXiv
         # 2503.14125), 0 for the plain residual. The hidden state keeps its shape.
+        # hc_bf16: store their hidden state in bf16 between branches, as the frac-connections
+        # paper's code does; the mixing is computed in fp32 and the encoder output is fp32 again.
         assert not (hyper_connections and frac_connections), "hyper- or frac-connections, not both"
+        assert not hc_bf16 or hyper_connections or frac_connections, "hc_bf16 needs hyper/frac"
+        stream_dtype = torch.bfloat16 if hc_bf16 else None
         self.hc_rate = hyper_connections
         if hyper_connections:
             block_cls = HyperConnectionBlock
-            block_kwargs = lambda ii: dict(rate=hyper_connections, dynamic=hc_dynamic, layer_id=ii)
+            block_kwargs = lambda ii: dict(
+                rate=hyper_connections, dynamic=hc_dynamic, layer_id=ii, stream_dtype=stream_dtype
+            )
         elif frac_connections:
             block_cls = FracConnectionBlock
-            block_kwargs = lambda ii: dict(rate=frac_connections, dynamic=fc_dynamic)
+            block_kwargs = lambda ii: dict(
+                rate=frac_connections, dynamic=fc_dynamic, stream_dtype=stream_dtype
+            )
         else:
             block_cls = Block
             block_kwargs = lambda ii: {}
@@ -158,9 +167,10 @@ class ViTMAE3D(nn.Module):
             x = x[:, :, None, :].expand(-1, -1, self.hc_rate, -1)
         for block in self.blocks:
             x = block(x)
+        dtype = self.norm.weight.dtype
         if self.hc_rate:
-            x = x.sum(dim=2)
-        x = self.norm(x)
+            x = x.sum(dim=2, dtype=dtype)
+        x = self.norm(x.to(dtype))
         return x
 
     def forward_decoder(

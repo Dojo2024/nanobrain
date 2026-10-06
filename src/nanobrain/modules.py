@@ -153,10 +153,19 @@ class HyperConnection(nn.Module):
     ([rate+1] streams) is never stored, and the stream sums are short loops torch.compile fuses.
     """
 
-    def __init__(self, dim: int, rate: int, layer_id: int, dynamic: bool = True) -> None:
+    def __init__(
+        self,
+        dim: int,
+        rate: int,
+        layer_id: int,
+        dynamic: bool = True,
+        stream_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         self.rate = rate
         self.dynamic = dynamic
+        # dtype the streams are stored in between branches, None keeps the computed fp32
+        self.stream_dtype = stream_dtype
         self.static_beta = nn.Parameter(torch.ones(rate))
         init_alpha0 = torch.zeros(rate, 1)
         init_alpha0[layer_id % rate, 0] = 1.0
@@ -178,7 +187,8 @@ class HyperConnection(nn.Module):
         if self.dynamic:
             with torch.autocast(h.device.type, enabled=False):
                 fn = torch.cat([self.dynamic_alpha_fn, self.dynamic_beta_fn[:, None]], dim=1)
-                dynamic = torch.tanh(self.layer_norm(h) @ fn)
+                norm_h = self.layer_norm(h.to(self.layer_norm.weight.dtype))
+                dynamic = torch.tanh(norm_h @ fn)
             alpha = alpha + dynamic[..., :-1] * self.dynamic_alpha_scale
             beta = beta + dynamic[..., -1] * self.dynamic_beta_scale
         # branch input A_m^T H
@@ -194,7 +204,8 @@ class HyperConnection(nn.Module):
     ) -> Float[Tensor, "B N R D"]:
         # A_r^T H + B^T h_o
         mixed = sum(alpha[..., r, 1:, None] * h[..., r, None, :] for r in range(self.rate))
-        return mixed + beta[..., :, None] * h_o[..., None, :]
+        h = mixed + beta[..., :, None] * h_o[..., None, :]
+        return h if self.stream_dtype is None else h.to(self.stream_dtype)
 
 
 class HyperConnectionBlock(Block):
@@ -202,11 +213,19 @@ class HyperConnectionBlock(Block):
     Takes and returns the hyper hidden matrix [B, N, rate, D]. Each branch counts as one layer
     for the init, so the attention of block i reads stream 2i % rate and its MLP (2i+1) % rate."""
 
-    def __init__(self, *, rate: int, layer_id: int, dynamic: bool = True, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        rate: int,
+        layer_id: int,
+        dynamic: bool = True,
+        stream_dtype: torch.dtype | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         dim = kwargs["dim"]
-        self.hc_attn = HyperConnection(dim, rate, 2 * layer_id, dynamic)
-        self.hc_mlp = HyperConnection(dim, rate, 2 * layer_id + 1, dynamic)
+        self.hc_attn = HyperConnection(dim, rate, 2 * layer_id, dynamic, stream_dtype)
+        self.hc_mlp = HyperConnection(dim, rate, 2 * layer_id + 1, dynamic, stream_dtype)
 
     def forward(
         self,
@@ -242,11 +261,19 @@ class FracConnection(nn.Module):
     the hidden state stays fp32, like the plain residual.
     """
 
-    def __init__(self, dim: int, rate: int, dynamic: bool = True) -> None:
+    def __init__(
+        self,
+        dim: int,
+        rate: int,
+        dynamic: bool = True,
+        stream_dtype: torch.dtype | None = None,
+    ) -> None:
         super().__init__()
         assert dim % rate == 0, (dim, rate)
         self.rate = rate
         self.dynamic = dynamic
+        # dtype the hidden state is stored in between branches, None keeps the computed fp32
+        self.stream_dtype = stream_dtype
         self.static_beta = nn.Parameter(torch.ones(rate))
         self.static_alpha = nn.Parameter(torch.cat([torch.eye(rate), torch.eye(rate)], dim=1))
         if dynamic:
@@ -267,7 +294,8 @@ class FracConnection(nn.Module):
         if self.dynamic:
             with torch.autocast(h.device.type, enabled=False):
                 fn = torch.cat([self.dynamic_alpha_fn, self.dynamic_beta_fn[:, None]], dim=1)
-                dynamic = torch.tanh(self.layer_norm(h) @ fn)
+                norm_h = self.layer_norm(h.to(self.layer_norm.weight.dtype))
+                dynamic = torch.tanh(norm_h @ fn)
             alpha = alpha + dynamic[..., :-1] * self.dynamic_alpha_scale
             beta = beta + dynamic[..., -1] * self.dynamic_beta_scale
         # branch input Y^T H
@@ -284,17 +312,25 @@ class FracConnection(nn.Module):
         # A^T H + B * h_o, per fraction
         h = h.unflatten(-1, (self.rate, -1))
         mixed = sum(alpha[..., i, self.rate :, None] * h[..., i, None, :] for i in range(self.rate))
-        return (mixed + beta[..., None] * h_o.unflatten(-1, (self.rate, -1))).flatten(-2)
+        h = (mixed + beta[..., None] * h_o.unflatten(-1, (self.rate, -1))).flatten(-2)
+        return h if self.stream_dtype is None else h.to(self.stream_dtype)
 
 
 class FracConnectionBlock(Block):
     """Block with its two residual adds replaced by frac-connections (the paper's Algorithm 3).
     Takes and returns the usual hidden state [B, N, D]."""
 
-    def __init__(self, *, rate: int, dynamic: bool = True, **kwargs) -> None:
+    def __init__(
+        self,
+        *,
+        rate: int,
+        dynamic: bool = True,
+        stream_dtype: torch.dtype | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
-        self.hc_attn = FracConnection(kwargs["dim"], rate, dynamic)
-        self.hc_mlp = FracConnection(kwargs["dim"], rate, dynamic)
+        self.hc_attn = FracConnection(kwargs["dim"], rate, dynamic, stream_dtype)
+        self.hc_mlp = FracConnection(kwargs["dim"], rate, dynamic, stream_dtype)
 
     def forward(
         self,
