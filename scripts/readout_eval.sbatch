@@ -14,8 +14,11 @@
 
 # Layer readout sweep on one checkpoint: rewrites checkpoint-last to a
 # nanobrain.readout model per readout and runs the unmodified eval on it.
-# usage: sbatch -J <job name> scripts/readout_eval.sbatch <run name> <seed>
+# usage: sbatch -J <job name> scripts/readout_eval.sbatch <run name> <seed> [<readout name> <tasks> <flags...>]
 #   e.g. sbatch -J n1n3-readout-s7338 scripts/readout_eval.sbatch n8/lr3e-3-cut40 7338
+#   With only <run name> <seed> it runs the sweep at the end of this file. With more arguments it
+#   runs that one readout instead: a name, the tasks ("" for the default 8), and nanobrain.readout
+#   flags, e.g. ... l1/dhc4-w384-matched 7338 cat6-9-12 "" --layers 6 9 12
 #
 # Each task runs on its own, so a probe that fails (e.g. the l-bfgs convergence assert on
 # wide concatenations) costs that task only. Failures are listed in ${OUT_DIR}/failed.txt.
@@ -27,6 +30,7 @@ set -euo pipefail
 
 RUN="$1"
 SEED="$2"
+shift 2
 cd /admin/home/dojo/nanobrain
 
 set -a
@@ -62,6 +66,12 @@ run_readout() {
     done
     rm "${ckpt}"
 }
+
+# one readout given on the command line instead of the sweep below
+if (( $# )); then
+    run_readout "$@"
+    exit 0
+fi
 
 # 2026-10-03 sweep on baseline/s*: l12 (control), l3, l6, l9, mean3-6-9-12, cat9-12 (layers 9-12),
 # cat3-6-9-12, cls-l12. Results in nanobrain-ideas.md section 0.10.
