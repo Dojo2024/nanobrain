@@ -222,6 +222,94 @@ class HyperConnectionBlock(Block):
         return h
 
 
+# Frac-connections: Zhu et al., "Frac-Connections: Fractional Extension of Hyper-Connections",
+# arXiv 2503.14125. Names follow the paper's Algorithm 2.
+
+
+class FracConnection(nn.Module):
+    """One frac-connection, wrapping one residual branch (attention or MLP).
+
+    Instead of copying the hidden state into rate streams (HyperConnection), it splits it into
+    rate fractions of D / rate (eq. 6), so the hidden state stays [B, N, D] and costs no extra
+    memory. alpha = [Y | A] ([rate, 2 rate]): Y mixes the fractions into the branch input, A mixes
+    them with each other; beta (B, [rate]) scales each fraction of the branch output. So the block
+    computes H' = A^T H + B * T(Y^T H), with H the hidden state viewed as [rate, D / rate] (eq. 8).
+    Dynamic (DFC, eqs. 11-14) adds tanh(norm(H) W) * s per fraction, with W = 0 at init. The init
+    (eq. 15), Y = A = I and B = 1, makes the block an ordinary pre-norm residual.
+
+    Arranged like HyperConnection: Y^T H is formed in width_connection and A^T H in
+    depth_connection, so the paper's mix_h is never stored. The paper casts mix_h to bf16; here
+    the hidden state stays fp32, like the plain residual.
+    """
+
+    def __init__(self, dim: int, rate: int, dynamic: bool = True) -> None:
+        super().__init__()
+        assert dim % rate == 0, (dim, rate)
+        self.rate = rate
+        self.dynamic = dynamic
+        self.static_beta = nn.Parameter(torch.ones(rate))
+        self.static_alpha = nn.Parameter(torch.cat([torch.eye(rate), torch.eye(rate)], dim=1))
+        if dynamic:
+            self.dynamic_alpha_fn = nn.Parameter(torch.zeros(dim // rate, 2 * rate))
+            self.dynamic_alpha_scale = nn.Parameter(torch.ones(1) * 0.01)
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim // rate))
+            self.dynamic_beta_scale = nn.Parameter(torch.ones(1) * 0.01)
+            self.layer_norm = LayerNorm(dim // rate)
+
+    def extra_repr(self):
+        return f"rate={self.rate}, dynamic={self.dynamic}"
+
+    def width_connection(
+        self, h: Float[Tensor, "B N D"]
+    ) -> tuple[Float[Tensor, "B N D"], Float[Tensor, "... R 2R"], Float[Tensor, "... R"]]:
+        h = h.unflatten(-1, (self.rate, -1))
+        alpha, beta = self.static_alpha, self.static_beta
+        if self.dynamic:
+            with torch.autocast(h.device.type, enabled=False):
+                fn = torch.cat([self.dynamic_alpha_fn, self.dynamic_beta_fn[:, None]], dim=1)
+                dynamic = torch.tanh(self.layer_norm(h) @ fn)
+            alpha = alpha + dynamic[..., :-1] * self.dynamic_alpha_scale
+            beta = beta + dynamic[..., -1] * self.dynamic_beta_scale
+        # branch input Y^T H
+        x = sum(alpha[..., i, : self.rate, None] * h[..., i, None, :] for i in range(self.rate))
+        return x.flatten(-2), alpha, beta
+
+    def depth_connection(
+        self,
+        h: Float[Tensor, "B N D"],
+        h_o: Float[Tensor, "B N D"],
+        alpha: Float[Tensor, "... R 2R"],
+        beta: Float[Tensor, "... R"],
+    ) -> Float[Tensor, "B N D"]:
+        # A^T H + B * h_o, per fraction
+        h = h.unflatten(-1, (self.rate, -1))
+        mixed = sum(alpha[..., i, self.rate :, None] * h[..., i, None, :] for i in range(self.rate))
+        return (mixed + beta[..., None] * h_o.unflatten(-1, (self.rate, -1))).flatten(-2)
+
+
+class FracConnectionBlock(Block):
+    """Block with its two residual adds replaced by frac-connections (the paper's Algorithm 3).
+    Takes and returns the usual hidden state [B, N, D]."""
+
+    def __init__(self, *, rate: int, dynamic: bool = True, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.hc_attn = FracConnection(kwargs["dim"], rate, dynamic)
+        self.hc_mlp = FracConnection(kwargs["dim"], rate, dynamic)
+
+    def forward(
+        self,
+        h: Float[Tensor, "B N D"],
+        context: Float[Tensor, "B M D"] | None = None,
+    ) -> Float[Tensor, "B N D"]:
+        x, alpha, beta = self.hc_attn.width_connection(h)
+        x = self.drop_path1(self.attn(self.norm1(x), context=context))
+        h = self.hc_attn.depth_connection(h, x, alpha, beta)
+        x, alpha, beta = self.hc_mlp.width_connection(h)
+        x = self.drop_path2(self.mlp(self.norm2(x)))
+        h = self.hc_mlp.depth_connection(h, x, alpha, beta)
+        return h
+
+
 # Position embedding
 
 

@@ -7,7 +7,13 @@ from einops import rearrange
 from torch import Tensor
 from jaxtyping import Float, Int
 
-from .modules import Block, HyperConnectionBlock, LayerNorm, SeparablePosEmbed3D
+from .modules import (
+    Block,
+    FracConnectionBlock,
+    HyperConnectionBlock,
+    LayerNorm,
+    SeparablePosEmbed3D,
+)
 
 
 class ViTMAE3D(nn.Module):
@@ -30,6 +36,8 @@ class ViTMAE3D(nn.Module):
         decoder_type: str = "self",
         hyper_connections: int = 0,
         hc_dynamic: bool = True,
+        frac_connections: int = 0,
+        fc_dynamic: bool = True,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -55,19 +63,29 @@ class ViTMAE3D(nn.Module):
 
         # hyper_connections: number of residual streams (Zhu et al., arXiv 2409.19606), 0 for the
         # plain residual. The encoder then carries [B, N, rate, D] and sums the streams at the end.
+        # frac_connections: number of fractions the hidden state is split into (Zhu et al., arXiv
+        # 2503.14125), 0 for the plain residual. The hidden state keeps its shape.
+        assert not (hyper_connections and frac_connections), "hyper- or frac-connections, not both"
         self.hc_rate = hyper_connections
         if hyper_connections:
-            hc_kwargs = dict(rate=hyper_connections, dynamic=hc_dynamic)
+            block_cls = HyperConnectionBlock
+            block_kwargs = lambda ii: dict(rate=hyper_connections, dynamic=hc_dynamic, layer_id=ii)
+        elif frac_connections:
+            block_cls = FracConnectionBlock
+            block_kwargs = lambda ii: dict(rate=frac_connections, dynamic=fc_dynamic)
+        else:
+            block_cls = Block
+            block_kwargs = lambda ii: {}
         self.blocks = nn.ModuleList(
             [
-                (HyperConnectionBlock if hyper_connections else Block)(
+                block_cls(
                     dim=embed_dim,
                     num_heads=num_heads,
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
                     drop_path=dpr[ii],
-                    **(dict(hc_kwargs, layer_id=ii) if hyper_connections else {}),
+                    **block_kwargs(ii),
                 )
                 for ii in range(depth)
             ]

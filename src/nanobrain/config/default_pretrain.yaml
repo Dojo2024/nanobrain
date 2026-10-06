@@ -59,6 +59,11 @@ model_kwargs:
   # input-dependent mixing (DHC) on top of the learned static mixing (SHC).
   hyper_connections: 0
   hc_dynamic: true
+  # Frac-connections (Zhu et al., arXiv 2503.14125): split the hidden state into this many
+  # fractions and mix them as hyper-connections mix streams, at no extra memory; 0 is off.
+  # fc_dynamic: input-dependent mixing (DFC) on top of the static mixing (SFC).
+  frac_connections: 0
+  fc_dynamic: true
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40
