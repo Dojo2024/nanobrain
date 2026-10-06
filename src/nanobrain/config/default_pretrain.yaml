@@ -54,6 +54,11 @@ model_kwargs:
   # self: MAE decoder over visible + mask tokens. cross: mask tokens cross-attend to the visible
   # embeddings only (CrossMAE), ~0.4x the decoder flops at 1280 visible / 1280 predicted.
   decoder_type: self
+  # Hyper-connections in the encoder (Zhu et al., ICLR 2025, arXiv 2409.19606): the number of
+  # residual streams per token (the expansion rate n), or 0 for the plain residual. hc_dynamic:
+  # input-dependent mixing (DHC) on top of the learned static mixing (SHC).
+  hyper_connections: 0
+  hc_dynamic: true
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40

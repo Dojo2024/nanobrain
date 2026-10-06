@@ -7,7 +7,7 @@ from einops import rearrange
 from torch import Tensor
 from jaxtyping import Float, Int
 
-from .modules import Block, LayerNorm, SeparablePosEmbed3D
+from .modules import Block, HyperConnectionBlock, LayerNorm, SeparablePosEmbed3D
 
 
 class ViTMAE3D(nn.Module):
@@ -28,6 +28,8 @@ class ViTMAE3D(nn.Module):
         drop_path_rate: float = 0.0,
         stats_head: bool = False,
         decoder_type: str = "self",
+        hyper_connections: int = 0,
+        hc_dynamic: bool = True,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -51,15 +53,21 @@ class ViTMAE3D(nn.Module):
         # stochastic depth decay rule
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
 
+        # hyper_connections: number of residual streams (Zhu et al., arXiv 2409.19606), 0 for the
+        # plain residual. The encoder then carries [B, N, rate, D] and sums the streams at the end.
+        self.hc_rate = hyper_connections
+        if hyper_connections:
+            hc_kwargs = dict(rate=hyper_connections, dynamic=hc_dynamic)
         self.blocks = nn.ModuleList(
             [
-                Block(
+                (HyperConnectionBlock if hyper_connections else Block)(
                     dim=embed_dim,
                     num_heads=num_heads,
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
                     drop_path=dpr[ii],
+                    **(dict(hc_kwargs, layer_id=ii) if hyper_connections else {}),
                 )
                 for ii in range(depth)
             ]
@@ -127,8 +135,13 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
+        if self.hc_rate:
+            # the hyper hidden matrix starts as rate copies of each token
+            x = x[:, :, None, :].expand(-1, -1, self.hc_rate, -1)
         for block in self.blocks:
             x = block(x)
+        if self.hc_rate:
+            x = x.sum(dim=2)
         x = self.norm(x)
         return x
 

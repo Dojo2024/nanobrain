@@ -55,11 +55,14 @@ class ReadoutViTMAE3D(ViTMAE3D):
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
+        if self.hc_rate:
+            x = x[:, :, None, :].expand(-1, -1, self.hc_rate, -1)
         outputs = []
         for layer, block in enumerate(self.blocks, start=1):
             x = block(x)
             if layer in layers:
-                outputs.append(self.norm(x))
+                # with hyper-connections a layer's output is the sum of its streams, as at the end
+                outputs.append(self.norm(x.sum(dim=2) if self.hc_rate else x))
             if layer == max(layers):
                 break
 

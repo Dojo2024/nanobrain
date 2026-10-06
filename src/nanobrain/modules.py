@@ -131,6 +131,86 @@ class Block(nn.Module):
         return x
 
 
+# Hyper-connections: Zhu et al., "Hyper-Connections", ICLR 2025, arXiv 2409.19606.
+# Names follow the paper's Algorithm 2. The hidden state is a "hyper hidden matrix" of rate
+# streams per token, [B, N, rate, D], instead of one [B, N, D] residual stream.
+
+
+class HyperConnection(nn.Module):
+    """One hyper-connection, wrapping one residual branch (attention or MLP).
+
+    width_connection mixes the streams with the matrix [A_m | A_r] (alpha, [rate, rate+1]): column
+    0 (A_m) forms the branch input, columns 1: (A_r) mix the streams with each other.
+    depth_connection adds the branch output into each stream, weighted by B (beta, [rate]).
+    Dynamic (DHC, eqs. 10-13) adds input-dependent terms tanh(norm(H) W) * s, with W = 0 at init.
+    The init (eq. 14) makes the block an ordinary pre-norm residual: B = 1, A_m reads stream
+    layer_id % rate, A_r = I.
+    """
+
+    def __init__(self, dim: int, rate: int, layer_id: int, dynamic: bool = True) -> None:
+        super().__init__()
+        self.rate = rate
+        self.dynamic = dynamic
+        self.static_beta = nn.Parameter(torch.ones(rate))
+        init_alpha0 = torch.zeros(rate, 1)
+        init_alpha0[layer_id % rate, 0] = 1.0
+        self.static_alpha = nn.Parameter(torch.cat([init_alpha0, torch.eye(rate)], dim=1))
+        if dynamic:
+            self.dynamic_alpha_fn = nn.Parameter(torch.zeros(dim, rate + 1))
+            self.dynamic_alpha_scale = nn.Parameter(torch.ones(1) * 0.01)
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros(dim))
+            self.dynamic_beta_scale = nn.Parameter(torch.ones(1) * 0.01)
+            self.layer_norm = LayerNorm(dim)
+
+    def extra_repr(self):
+        return f"rate={self.rate}, dynamic={self.dynamic}"
+
+    def width_connection(
+        self, h: Float[Tensor, "B N R D"]
+    ) -> tuple[Float[Tensor, "B N R+1 D"], Float[Tensor, "... R"]]:
+        alpha, beta = self.static_alpha, self.static_beta
+        if self.dynamic:
+            norm_h = self.layer_norm(h)
+            alpha = alpha + torch.tanh(norm_h @ self.dynamic_alpha_fn) * self.dynamic_alpha_scale
+            beta = beta + torch.tanh(norm_h @ self.dynamic_beta_fn) * self.dynamic_beta_scale
+        # row 0 is the branch input, rows 1: are the mixed streams
+        mix_h = alpha.transpose(-1, -2) @ h
+        return mix_h, beta
+
+    def depth_connection(
+        self,
+        mix_h: Float[Tensor, "B N R+1 D"],
+        h_o: Float[Tensor, "B N D"],
+        beta: Float[Tensor, "... R"],
+    ) -> Float[Tensor, "B N R D"]:
+        return h_o[..., None, :] * beta[..., :, None] + mix_h[..., 1:, :]
+
+
+class HyperConnectionBlock(Block):
+    """Block with its two residual adds replaced by hyper-connections (the paper's Algorithm 3).
+    Takes and returns the hyper hidden matrix [B, N, rate, D]. Each branch counts as one layer
+    for the init, so the attention of block i reads stream 2i % rate and its MLP (2i+1) % rate."""
+
+    def __init__(self, *, rate: int, layer_id: int, dynamic: bool = True, **kwargs) -> None:
+        super().__init__(**kwargs)
+        dim = kwargs["dim"]
+        self.hc_attn = HyperConnection(dim, rate, 2 * layer_id, dynamic)
+        self.hc_mlp = HyperConnection(dim, rate, 2 * layer_id + 1, dynamic)
+
+    def forward(
+        self,
+        h: Float[Tensor, "B N R D"],
+        context: Float[Tensor, "B M D"] | None = None,
+    ) -> Float[Tensor, "B N R D"]:
+        mix_h, beta = self.hc_attn.width_connection(h)
+        x = self.drop_path1(self.attn(self.norm1(mix_h[..., 0, :]), context=context))
+        h = self.hc_attn.depth_connection(mix_h, x, beta)
+        mix_h, beta = self.hc_mlp.width_connection(h)
+        x = self.drop_path2(self.mlp(self.norm2(mix_h[..., 0, :])))
+        h = self.hc_mlp.depth_connection(mix_h, x, beta)
+        return h
+
+
 # Position embedding
 
 
