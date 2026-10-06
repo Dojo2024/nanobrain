@@ -139,12 +139,18 @@ class Block(nn.Module):
 class HyperConnection(nn.Module):
     """One hyper-connection, wrapping one residual branch (attention or MLP).
 
-    width_connection mixes the streams with the matrix [A_m | A_r] (alpha, [rate, rate+1]): column
-    0 (A_m) forms the branch input, columns 1: (A_r) mix the streams with each other.
-    depth_connection adds the branch output into each stream, weighted by B (beta, [rate]).
+    The matrix [A_m | A_r] (alpha, [rate, rate+1]) mixes the streams: column 0 (A_m) forms the
+    branch input, columns 1: (A_r) mix the streams with each other. B (beta, [rate]) weights the
+    branch output added into each stream. So the block computes H' = A_r^T H + B^T T(A_m^T H).
     Dynamic (DHC, eqs. 10-13) adds input-dependent terms tanh(norm(H) W) * s, with W = 0 at init.
     The init (eq. 14) makes the block an ordinary pre-norm residual: B = 1, A_m reads stream
     layer_id % rate, A_r = I.
+
+    Same math as the paper's Algorithm 2, arranged to move less memory, because at width 512 the
+    rate-stream tensors cost more time than the matrix multiplies: W_alpha and W_beta are one fp32
+    projection of norm(H), width_connection returns only the branch input A_m^T H, and
+    depth_connection forms A_r^T H together with the B-weighted output. The paper's mix_h
+    ([rate+1] streams) is never stored, and the stream sums are short loops torch.compile fuses.
     """
 
     def __init__(self, dim: int, rate: int, layer_id: int, dynamic: bool = True) -> None:
@@ -167,23 +173,28 @@ class HyperConnection(nn.Module):
 
     def width_connection(
         self, h: Float[Tensor, "B N R D"]
-    ) -> tuple[Float[Tensor, "B N R+1 D"], Float[Tensor, "... R"]]:
+    ) -> tuple[Float[Tensor, "B N D"], Float[Tensor, "... R R+1"], Float[Tensor, "... R"]]:
         alpha, beta = self.static_alpha, self.static_beta
         if self.dynamic:
-            norm_h = self.layer_norm(h)
-            alpha = alpha + torch.tanh(norm_h @ self.dynamic_alpha_fn) * self.dynamic_alpha_scale
-            beta = beta + torch.tanh(norm_h @ self.dynamic_beta_fn) * self.dynamic_beta_scale
-        # row 0 is the branch input, rows 1: are the mixed streams
-        mix_h = alpha.transpose(-1, -2) @ h
-        return mix_h, beta
+            with torch.autocast(h.device.type, enabled=False):
+                fn = torch.cat([self.dynamic_alpha_fn, self.dynamic_beta_fn[:, None]], dim=1)
+                dynamic = torch.tanh(self.layer_norm(h) @ fn)
+            alpha = alpha + dynamic[..., :-1] * self.dynamic_alpha_scale
+            beta = beta + dynamic[..., -1] * self.dynamic_beta_scale
+        # branch input A_m^T H
+        x = sum(alpha[..., r, 0, None] * h[..., r, :] for r in range(self.rate))
+        return x, alpha, beta
 
     def depth_connection(
         self,
-        mix_h: Float[Tensor, "B N R+1 D"],
+        h: Float[Tensor, "B N R D"],
         h_o: Float[Tensor, "B N D"],
+        alpha: Float[Tensor, "... R R+1"],
         beta: Float[Tensor, "... R"],
     ) -> Float[Tensor, "B N R D"]:
-        return h_o[..., None, :] * beta[..., :, None] + mix_h[..., 1:, :]
+        # A_r^T H + B^T h_o
+        mixed = sum(alpha[..., r, 1:, None] * h[..., r, None, :] for r in range(self.rate))
+        return mixed + beta[..., :, None] * h_o[..., None, :]
 
 
 class HyperConnectionBlock(Block):
@@ -202,12 +213,12 @@ class HyperConnectionBlock(Block):
         h: Float[Tensor, "B N R D"],
         context: Float[Tensor, "B M D"] | None = None,
     ) -> Float[Tensor, "B N R D"]:
-        mix_h, beta = self.hc_attn.width_connection(h)
-        x = self.drop_path1(self.attn(self.norm1(mix_h[..., 0, :]), context=context))
-        h = self.hc_attn.depth_connection(mix_h, x, beta)
-        mix_h, beta = self.hc_mlp.width_connection(h)
-        x = self.drop_path2(self.mlp(self.norm2(mix_h[..., 0, :])))
-        h = self.hc_mlp.depth_connection(mix_h, x, beta)
+        x, alpha, beta = self.hc_attn.width_connection(h)
+        x = self.drop_path1(self.attn(self.norm1(x), context=context))
+        h = self.hc_attn.depth_connection(h, x, alpha, beta)
+        x, alpha, beta = self.hc_mlp.width_connection(h)
+        x = self.drop_path2(self.mlp(self.norm2(x)))
+        h = self.hc_mlp.depth_connection(h, x, alpha, beta)
         return h
 
 
