@@ -70,6 +70,9 @@ model_kwargs:
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40
+# Stop training after this many epochs, or null to run all epochs. The lr schedule still spans
+# epochs, so a run cut at stop_epoch matches one cut at that epoch by a time limit.
+stop_epoch: null
 batch_size: 32
 accum_iter: 1
 

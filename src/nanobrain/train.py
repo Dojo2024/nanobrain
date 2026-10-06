@@ -164,6 +164,7 @@ def main(args: DictConfig):
     misc.load_model(args, model, optimizer, loss_scaler)
     # elapsed time restarts on resume, which would replay the schedule
     assert not (args.time_budget and args.start_epoch), "a time budget run can't resume"
+    assert not (args.time_budget and args.stop_epoch), "a time budget run stops at the budget"
     # the EMA copies are not saved for resuming
     assert not (args.ema_decays and args.start_epoch), "an ema run can't resume"
     ema = misc.ModelEMA(model, args.ema_decays) if args.ema_decays else None
@@ -174,7 +175,8 @@ def main(args: DictConfig):
     if args.time_budget:
         epochs = itertools.count(args.start_epoch)
     else:
-        epochs = range(args.start_epoch, args.epochs)
+        assert not args.stop_epoch or args.stop_epoch <= args.epochs, "stop_epoch is past epochs"
+        epochs = range(args.start_epoch, args.stop_epoch or args.epochs)
     for epoch in epochs:
         train_stats = train_one_epoch(
             args,
