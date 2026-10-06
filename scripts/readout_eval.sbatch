@@ -68,6 +68,13 @@ run_readout() {
 
 # 2026-10-04 on n8/lr3e-3-cut40/s*: cat6-12, cat9-12 (layers 9 and 12), cls-l12 (N1 and N3).
 
-# three layers, 1152 wide, compared to ${RUN_DIR}/readout/cat9-12 and ${RUN_DIR}/eval
-run_readout cat6-9-12 "" --layers 6 9 12
+# 2026-10-05 on a17/batched-nt/s*: cat6-9-12 (layers 6, 9, 12, 1152 wide), the dense half of the
+# split readout.
+
+# 2026-10-06 on l1/dhc4-w384-matched/s* and a17/batched-nt/s*: layers 3, 6 and 9 one at a time
+# (384 wide), compared to ${RUN_DIR}/eval (layer 12). With hyper-connections a layer is the sum
+# of its streams.
+run_readout l3 "" --layers 3
+run_readout l6 "" --layers 6
+run_readout l9 "" --layers 9
 echo "[$(date +%T)] done"
