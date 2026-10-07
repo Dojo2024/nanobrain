@@ -67,6 +67,10 @@ model_kwargs:
   # Store the hyper-/frac-connection hidden state in bf16 between blocks (the frac-connections
   # paper's code does), halving its memory traffic; the mixing is computed in fp32.
   hc_bf16: false
+  # Manifold-constrained hyper-connections (mHC, Xie et al., arXiv 2512.24880): the number of
+  # streams, or 0 for off. Like hyper_connections, but the stream mixing is doubly stochastic
+  # (Sinkhorn-Knopp) and the read/write weights are non-negative (sigmoid).
+  mhc: 0
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40

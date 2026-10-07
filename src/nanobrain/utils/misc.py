@@ -525,7 +525,7 @@ def get_param_groups(model, patch_embed_lr_mult=1.0, muon=False, muon_lr_mult=1.
 
         if name.endswith(".bias") or "norm" in name or "gamma" in name:
             d["wd_multiplier"] = 0.0
-        # hyper- and frac-connections (modules hc_attn, hc_mlp): the static matrices and scales
+        # hyper-, frac- and mHC connections (modules hc_attn, hc_mlp): the static terms and scales
         # get no weight decay, the dynamic projections do (Zhu et al., arXiv 2409.19606 and
         # 2503.14125); all of them stay on AdamW
         is_hc = ".hc_" in name

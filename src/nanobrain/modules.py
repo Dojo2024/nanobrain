@@ -346,6 +346,127 @@ class FracConnectionBlock(Block):
         return h
 
 
+def sinkhorn_knopp(logits: Tensor, iters: int) -> Tensor:
+    """Doubly stochastic matrix from logits [..., n, n] (mHC eq. 9): M0 = exp(logits), then iters
+    rounds of M = T_r(T_c(M)), columns normalized then rows. Subtracting the max first changes
+    nothing (both normalizations are scale invariant) and keeps exp finite."""
+    m = torch.exp(logits - logits.amax(dim=(-2, -1), keepdim=True))
+    for _ in range(iters):
+        m = m / m.sum(dim=-2, keepdim=True)
+        m = m / m.sum(dim=-1, keepdim=True)
+    return m
+
+
+class ManifoldHyperConnection(nn.Module):
+    """One manifold-constrained hyper-connection (mHC, Xie et al., arXiv 2512.24880), wrapping one
+    residual branch. With the hidden matrix x_l [n, C] the block computes (eq. 3)
+
+        x_{l+1} = H_res x_l + H_post^T F(H_pre x_l)
+
+    with coefficients from the flattened, RMS-normed hidden matrix (eqs. 7-8):
+
+        x' = RMSNorm(vec(x_l))                          [1, nC]
+        H_pre  = sigmoid(a_pre * x' phi_pre + b_pre)      [1, n]
+        H_post = 2 sigmoid(a_post * x' phi_post + b_post) [1, n]
+        H_res  = SinkhornKnopp(a_res * mat(x' phi_res) + b_res)  [n, n], doubly stochastic
+
+    The paper gives a = 0.01 but not the init of phi or b. Here phi = 0, as HC's dynamic
+    projections, and b encodes HC's init: the branch reads mostly stream layer_id % n (H_pre
+    .982 there, .006 on the others, summing to 1), writes every stream (b_post 0, so H_post = 1)
+    and leaves the streams unmixed (b_res = 4 I, so H_res has .95 on the diagonal). As with HC,
+    an n-stream encoder that starts from copies of the embedding is then exactly a pre-norm
+    residual at init: identical streams stay identical under any doubly stochastic H_res and
+    equal writes, and H_pre x_l is their weighted mean, the stream itself. The coefficients are computed in fp32 with autocast off.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        rate: int,
+        layer_id: int,
+        sinkhorn_iters: int = 20,
+        stream_dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.rate = rate
+        self.sinkhorn_iters = sinkhorn_iters
+        self.stream_dtype = stream_dtype
+        self.rms_norm = nn.RMSNorm(rate * dim, eps=1e-6)
+        # phi_pre | phi_post | phi_res as one projection
+        self.dynamic_fn = nn.Parameter(torch.zeros(rate * dim, 2 * rate + rate * rate))
+        self.pre_scale = nn.Parameter(torch.full((1,), 0.01))
+        self.post_scale = nn.Parameter(torch.full((1,), 0.01))
+        self.res_scale = nn.Parameter(torch.full((1,), 0.01))
+        # sigmoid(b_pre) is .982 on stream layer_id % n and sums to exactly 1 over the streams
+        rest = (1 - torch.sigmoid(torch.tensor(4.0))) / (rate - 1)
+        static_pre = torch.full((rate,), torch.logit(rest).item())
+        static_pre[layer_id % rate] = 4.0
+        self.static_pre = nn.Parameter(static_pre)
+        self.static_post = nn.Parameter(torch.zeros(rate))
+        self.static_res = nn.Parameter(4.0 * torch.eye(rate))
+
+    def extra_repr(self):
+        return f"rate={self.rate}, sinkhorn_iters={self.sinkhorn_iters}"
+
+    def width_connection(
+        self, h: Float[Tensor, "... R D"]
+    ) -> tuple[Float[Tensor, "... D"], Float[Tensor, "... R"], Float[Tensor, "... R R"]]:
+        """Branch input H_pre x_l, plus H_post and H_res for depth_connection."""
+        n = self.rate
+        with torch.autocast(h.device.type, enabled=False):
+            h = h.to(self.rms_norm.weight.dtype)
+            z = self.rms_norm(h.flatten(-2)) @ self.dynamic_fn
+            pre = torch.sigmoid(self.pre_scale * z[..., :n] + self.static_pre)
+            post = 2 * torch.sigmoid(self.post_scale * z[..., n : 2 * n] + self.static_post)
+            res = self.res_scale * z[..., 2 * n :].unflatten(-1, (n, n)) + self.static_res
+            res = sinkhorn_knopp(res, self.sinkhorn_iters)
+            x = sum(pre[..., r, None] * h[..., r, :] for r in range(n))
+        return x, post, res
+
+    def depth_connection(
+        self,
+        h: Float[Tensor, "... R D"],
+        h_o: Float[Tensor, "... D"],
+        post: Float[Tensor, "... R"],
+        res: Float[Tensor, "... R R"],
+    ) -> Float[Tensor, "... R D"]:
+        """H_res x_l + H_post^T h_o: stream i gets sum_j H_res[i, j] x_j + H_post[i] h_o."""
+        out = post[..., :, None] * h_o[..., None, :]
+        for r in range(self.rate):
+            out = out + res[..., :, r, None] * h[..., r, None, :]
+        return out if self.stream_dtype is None else out.to(self.stream_dtype)
+
+
+class ManifoldHyperConnectionBlock(Block):
+    """Block with its two residual adds replaced by mHC. Takes and returns the hidden matrix
+    [B, N, n, D]. Each branch is one layer for the init, as in HyperConnectionBlock."""
+
+    def __init__(
+        self,
+        *,
+        rate: int,
+        layer_id: int,
+        stream_dtype: torch.dtype | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.hc_attn = ManifoldHyperConnection(kwargs["dim"], rate, 2 * layer_id, stream_dtype=stream_dtype)
+        self.hc_mlp = ManifoldHyperConnection(kwargs["dim"], rate, 2 * layer_id + 1, stream_dtype=stream_dtype)
+
+    def forward(
+        self,
+        h: Float[Tensor, "B N R D"],
+        context: Float[Tensor, "B M D"] | None = None,
+    ) -> Float[Tensor, "B N R D"]:
+        x, post, res = self.hc_attn.width_connection(h)
+        x = self.drop_path1(self.attn(self.norm1(x), context=context))
+        h = self.hc_attn.depth_connection(h, x, post, res)
+        x, post, res = self.hc_mlp.width_connection(h)
+        x = self.drop_path2(self.mlp(self.norm2(x)))
+        h = self.hc_mlp.depth_connection(h, x, post, res)
+        return h
+
+
 # Position embedding
 
 

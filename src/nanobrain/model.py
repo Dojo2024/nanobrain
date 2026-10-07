@@ -12,6 +12,7 @@ from .modules import (
     FracConnectionBlock,
     HyperConnectionBlock,
     LayerNorm,
+    ManifoldHyperConnectionBlock,
     SeparablePosEmbed3D,
 )
 
@@ -39,6 +40,7 @@ class ViTMAE3D(nn.Module):
         frac_connections: int = 0,
         fc_dynamic: bool = True,
         hc_bf16: bool = False,
+        mhc: int = 0,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -68,11 +70,16 @@ class ViTMAE3D(nn.Module):
         # 2503.14125), 0 for the plain residual. The hidden state keeps its shape.
         # hc_bf16: store their hidden state in bf16 between branches, as the frac-connections
         # paper's code does; the mixing is computed in fp32 and the encoder output is fp32 again.
-        assert not (hyper_connections and frac_connections), "hyper- or frac-connections, not both"
-        assert not hc_bf16 or hyper_connections or frac_connections, "hc_bf16 needs hyper/frac"
+        # mhc: number of streams for manifold-constrained hyper-connections (Xie et al., arXiv
+        # 2512.24880), 0 off. Same [B, N, rate, D] hidden matrix and stream sum as hyper_connections.
+        assert sum(map(bool, (hyper_connections, frac_connections, mhc))) <= 1, "one connection type"
+        assert not hc_bf16 or hyper_connections or frac_connections or mhc, "hc_bf16 needs hyper/frac/mhc"
         stream_dtype = torch.bfloat16 if hc_bf16 else None
-        self.hc_rate = hyper_connections
-        if hyper_connections:
+        self.hc_rate = hyper_connections or mhc
+        if mhc:
+            block_cls = ManifoldHyperConnectionBlock
+            block_kwargs = lambda ii: dict(rate=mhc, layer_id=ii, stream_dtype=stream_dtype)
+        elif hyper_connections:
             block_cls = HyperConnectionBlock
             block_kwargs = lambda ii: dict(
                 rate=hyper_connections, dynamic=hc_dynamic, layer_id=ii, stream_dtype=stream_dtype
