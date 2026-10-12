@@ -78,7 +78,7 @@ class ReadoutViTMAE3D(ViTMAE3D):
         layers: tuple[int, ...],
     ) -> tuple[Float[Tensor, "B C"], Float[Tensor, "B Gx Gy Gz C"]]:
         """Class token and patch embeddings of the given blocks, one forward per image as in
-        ViTMAE3D.dense_embed."""
+        ViTMAE3D.dense_embed_native."""
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
         patch_grid_size = [size // self.patch_size for size in self.grid_size]
@@ -105,7 +105,7 @@ class ReadoutViTMAE3D(ViTMAE3D):
         embeds = embeds.reshape(B, *patch_grid_size, dim)
         return cls_embeds, embeds
 
-    def dense_embed(
+    def dense_embed_native(
         self,
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],

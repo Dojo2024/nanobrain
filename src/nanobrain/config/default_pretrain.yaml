@@ -35,9 +35,19 @@ mask_groups: null
 # Standardize each target patch by its in-mask mean and variance (MAE's norm_pix_loss), so the
 # loss is on local structure rather than intensity level.
 norm_target: false
+# Random gamma and smooth bias field on each training image before the in-mask z-score
+# (data.augment_intensity, A18). Training only; the eval has its own preprocessing.
+intensity_aug: false
 # Weight of the stats_head loss (model_kwargs.stats_head, needs norm_target): each predicted patch's
 # in-mask intensity mean and log std, the information norm_target takes out of the target.
 stats_weight: 1.0
+# Weight of the layout_head loss (model_kwargs.layout_head).
+layout_weight: 0.1
+# Weight of the global_loss (model_kwargs.global_loss), its SIGReg share lambda (LeJEPA default
+# 0.05) and the InfoNCE temperature (COJEPA 0.07).
+global_weight: 0.1
+sigreg_lambda: 0.05
+infonce_tau: 0.07
 
 # Model (ViT-S encoder).
 model_kwargs:
@@ -51,6 +61,19 @@ model_kwargs:
   drop_path_rate: 0.0
   # 2 extra decoder outputs per patch for its intensity mean and log std (see stats_weight)
   stats_head: false
+  # P14 (i): 16 extra decoder outputs per patch, the raw in-mask mean and log std of each of its
+  # 8 octant sub-cubes (see layout_weight)
+  layout_head: false
+  # P14 (ii): decode each predicted patch as decoder_sub^3 sub-cube tokens on the finer grid,
+  # with decoder_sub_depth blocks over them (e.g. 2 at patch_size 16 predicts at 8 mm); 1 is off
+  decoder_sub: 1
+  decoder_sub_depth: 1
+  # L8: a loss on each sequence's mean visible token through a projector the eval never uses
+  # (see global_weight): none, sigreg (LeJEPA invariance + SIGReg) or infonce (COJEPA)
+  global_loss: none
+  global_hidden_dim: 2048
+  global_proj_dim: 256
+  sigreg_slices: 1024
   # self: MAE decoder over visible + mask tokens. cross: mask tokens cross-attend to the visible
   # embeddings only (CrossMAE), ~0.4x the decoder flops at 1280 visible / 1280 predicted.
   decoder_type: self

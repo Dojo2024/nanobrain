@@ -33,23 +33,27 @@ class BrainNpzDataset(Dataset):
         return sample
 
 
-def process_sample(sample: dict[str, torch.Tensor | Any]):
+def process_sample(sample: dict[str, torch.Tensor | Any], intensity_aug: bool = False):
     values = sample["values"]
     mask_rle = sample["mask"]
     shape = sample["shape"]
     spacing = sample["spacing"]
 
-    # normalize values
-    values = values.float()
-    values = values / values.max()
-    values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+    if intensity_aug:
+        mask = brle_to_dense(mask_rle, shape=shape)
+        image = augment_intensity(values, mask)
+    else:
+        # normalize values
+        values = values.float()
+        values = values / values.max()
+        values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
 
-    # decode mask
-    mask = brle_to_dense(mask_rle, shape=shape)
+        # decode mask
+        mask = brle_to_dense(mask_rle, shape=shape)
 
-    # make dense image
-    image = torch.zeros(mask.shape, dtype=values.dtype, device=values.device)
-    image.masked_scatter_(mask, values)
+        # make dense image
+        image = torch.zeros(mask.shape, dtype=values.dtype, device=values.device)
+        image.masked_scatter_(mask, values)
 
     # resizing
     image = resample_image(image, spacing=spacing, target_spacing=TARGET_SPACING)
@@ -64,6 +68,38 @@ def process_sample(sample: dict[str, torch.Tensor | Any]):
 
     sample = {"image": image, "mask": mask}
     return sample
+
+
+# Intensity augmentation (A18, SynthSeg-style), training only: a random gamma curve and a smooth
+# multiplicative bias field, applied before the in-mask z-score so the input and the target see
+# the same distorted contrast. log gamma ~ U(-0.4, 0.4). The log field is a 4^3 Gaussian grid with
+# a per-image std ~ U(0, 0.3), upsampled to the native image.
+GAMMA_LOG_RANGE = 0.4
+BIAS_GRID = 4
+BIAS_MAX_STD = 0.3
+
+
+def augment_intensity(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    device = values.device
+    values = values.float()
+    values = (values / values.max()).clamp_min(0)
+    log_gamma = (2 * torch.rand((), device=device) - 1) * GAMMA_LOG_RANGE
+    values = values.pow(log_gamma.exp())
+
+    image = torch.zeros(mask.shape, dtype=values.dtype, device=device)
+    image.masked_scatter_(mask, values)
+
+    field_std = torch.rand((), device=device) * BIAS_MAX_STD
+    log_field = torch.randn((1, 1, BIAS_GRID, BIAS_GRID, BIAS_GRID), device=device) * field_std
+    field = F.interpolate(log_field, size=mask.shape, mode="trilinear", align_corners=True)
+    image = image * field[0, 0].exp()
+
+    # in-mask z-score from masked sums, which avoids boolean indexing and its host sync
+    weight = mask.float()
+    count = weight.sum()
+    mean = (image * weight).sum() / count
+    std = (((image - mean) * weight).square().sum() / count).sqrt().clamp_min(1e-6)
+    return (image - mean) / std * weight
 
 
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:

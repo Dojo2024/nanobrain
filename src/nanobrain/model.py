@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from .modules import (
     Block,
@@ -41,6 +41,13 @@ class ViTMAE3D(nn.Module):
         fc_dynamic: bool = True,
         hc_bf16: bool = False,
         mhc: int = 0,
+        decoder_sub: int = 1,
+        decoder_sub_depth: int = 1,
+        layout_head: bool = False,
+        global_loss: str = "none",
+        global_hidden_dim: int = 2048,
+        global_proj_dim: int = 256,
+        sigreg_slices: int = 1024,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -131,9 +138,67 @@ class ViTMAE3D(nn.Module):
         )
 
         self.decoder_norm = LayerNorm(decoder_embed_dim)
+
+        # decoder_sub (P14 (ii), pixel-unshuffle decoder, after Scale-MAE / LocalMIM): each predicted
+        # patch is split into decoder_sub^3 sub-cubes, each decoded as its own token on the finer
+        # grid: Linear(Dd -> sub^3 Dd), the sub-cube's position, decoder_sub_depth blocks over all
+        # sub-tokens, then a head over the sub-cube's voxels. The target is the same voxels
+        # (norm_target still standardizes the whole parent patch). 1 is the plain decoder head.
+        assert patch_size % decoder_sub == 0, (patch_size, decoder_sub)
+        self.decoder_sub = decoder_sub
+        head_dim = patch_dim
+        if decoder_sub > 1:
+            self.decoder_unshuffle = nn.Linear(decoder_embed_dim, decoder_sub**3 * decoder_embed_dim)
+            sub_grid_size = tuple(size * decoder_sub for size in patch_grid_size)
+            self.decoder_sub_pos_embed = SeparablePosEmbed3D(sub_grid_size, decoder_embed_dim)
+            self.decoder_sub_blocks = nn.ModuleList(
+                [
+                    Block(
+                        dim=decoder_embed_dim,
+                        num_heads=decoder_num_heads,
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        mlp_ratio=mlp_ratio,
+                    )
+                    for ii in range(decoder_sub_depth)
+                ]
+            )
+            self.decoder_sub_norm = LayerNorm(decoder_embed_dim)
+            offsets = torch.stack(
+                torch.meshgrid(*[torch.arange(decoder_sub)] * 3, indexing="ij"), dim=-1
+            ).reshape(-1, 3)
+            self.register_buffer("sub_offsets", offsets, persistent=False)
+            head_dim = (patch_size // decoder_sub) ** 3
+
         # stats_head: 2 extra outputs per patch, its in-mask intensity mean and log std
+        # layout_head (P14 (i)): 16 extra outputs per patch, the raw in-mask mean and log std of each
+        # of its 8 octant sub-cubes, i.e. where intensity sits inside the patch
+        assert not (stats_head and layout_head), "one auxiliary head"
+        assert decoder_sub == 1 or not (stats_head or layout_head), "aux heads need decoder_sub 1"
         self.stats_head = stats_head
-        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim + (2 if stats_head else 0))
+        self.layout_head = layout_head
+        num_aux = 2 if stats_head else 16 if layout_head else 0
+        self.decoder_head = nn.Linear(decoder_embed_dim, head_dim + num_aux)
+
+        # global_loss (L8): a loss on the mean of each sequence's visible encoder tokens (the same
+        # patch mean global_embed reads), through a projector that the eval never uses. The
+        # num_samples sequences of one image are its views.
+        #   sigreg: LeJEPA (Balestriero & LeCun, arXiv 2511.08544): pull an image's views to their
+        #     mean, and push each view's batch of projections toward an isotropic Gaussian (SIGReg)
+        #   infonce: COJEPA's contrastive term (Mager & Hansen, arXiv 2607.11962), between views 1 and 2
+        assert global_loss in ("none", "sigreg", "infonce"), global_loss
+        self.global_loss = global_loss
+        self.sigreg_slices = sigreg_slices
+        if global_loss != "none":
+            self.global_proj = nn.Sequential(
+                nn.Linear(embed_dim, global_hidden_dim),
+                LayerNorm(global_hidden_dim),
+                nn.GELU(),
+                nn.Linear(global_hidden_dim, global_hidden_dim),
+                LayerNorm(global_hidden_dim),
+                nn.GELU(),
+                nn.Linear(global_hidden_dim, global_proj_dim),
+            )
         self.init_weights()
 
     @classmethod
@@ -205,6 +270,15 @@ class ViTMAE3D(nn.Module):
             x = x[:, -M:]
 
         x = self.decoder_norm(x)
+        if self.decoder_sub > 1:
+            s = self.decoder_sub
+            x = self.decoder_unshuffle(x).reshape(B, M * s**3, -1)
+            sub_coord = target_coord[:, :, None, :] * s + self.sub_offsets
+            x = self.decoder_sub_pos_embed(x, sub_coord.reshape(B, M * s**3, 3))
+            for block in self.decoder_sub_blocks:
+                x = block(x)
+            x = self.decoder_head(self.decoder_sub_norm(x))
+            return merge_subcubes(x.reshape(B, M, s**3, -1), self.patch_size, s)
         x = self.decoder_head(x)
         return x
 
@@ -219,6 +293,10 @@ class ViTMAE3D(nn.Module):
         mask_groups: Int[Tensor, "K N"] | None = None,
         norm_target: bool = False,
         stats_weight: float = 1.0,
+        layout_weight: float = 0.1,
+        global_weight: float = 0.1,
+        sigreg_lambda: float = 0.05,
+        infonce_tau: float = 0.07,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -243,6 +321,17 @@ class ViTMAE3D(nn.Module):
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
 
+        if self.layout_head:
+            # raw in-mask mean and log std of each octant sub-cube, before norm_target removes the
+            # patch's level; octants with under 2 in-mask voxels have no spread and are skipped
+            octant_values = split_subcubes(target_patches, self.patch_size, 2)
+            octant_mask = split_subcubes(target_mask_patches, self.patch_size, 2)
+            count = octant_mask.sum(dim=-1)
+            mean = (octant_mask * octant_values).sum(dim=-1) / count.clamp_min(1)
+            var = (octant_mask * (octant_values - mean[..., None]) ** 2).sum(dim=-1) / count.clamp_min(1)
+            layout_target = torch.cat([mean, 0.5 * torch.log(var + 1e-6)], dim=-1)
+            layout_valid = (count > 1).to(mean.dtype).repeat(1, 1, 2)
+
         if norm_target:
             # MAE's norm_pix_loss: each target patch standardized by the mean and variance of its
             # in-mask voxels, so the loss is on local structure rather than intensity level
@@ -257,8 +346,29 @@ class ViTMAE3D(nn.Module):
         pred_patches = self.forward_decoder(embeds, target_coord)
         if self.stats_head:
             pred_patches, pred_stats = pred_patches.split([pred_patches.shape[-1] - 2, 2], dim=-1)
+        if self.layout_head:
+            pred_patches, pred_layout = pred_patches.split([pred_patches.shape[-1] - 16, 16], dim=-1)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
         loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
+        if self.layout_head:
+            layout_loss = layout_valid * (pred_layout - layout_target) ** 2
+            loss = loss + layout_weight * layout_loss.sum() / layout_valid.sum().clamp_min(1)
+        # training only: train.py's end-of-epoch plot calls the model in eval mode with 1 sequence
+        if self.global_loss != "none" and self.training:
+            assert num_samples >= 2, "the global loss compares the sequences of one image"
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            z = self.global_proj(pooled).float().reshape(B, num_samples, -1)
+            if self.global_loss == "sigreg":
+                # LeJEPA: (1 - lambda) * invariance to the views' mean + lambda * SIGReg per view
+                inv = (z - z.mean(dim=1, keepdim=True)).square().mean()
+                sig = torch.stack([sigreg(z[:, ii], self.sigreg_slices) for ii in range(num_samples)])
+                global_term = (1 - sigreg_lambda) * inv + sigreg_lambda * sig.mean()
+            else:
+                z1, z2 = F.normalize(z[:, 0], dim=-1), F.normalize(z[:, 1], dim=-1)
+                logits = z1 @ z2.T / infonce_tau
+                labels = torch.arange(B, device=z.device)
+                global_term = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+            loss = loss + global_weight * global_term
         if self.stats_head:
             # puts back the intensity level and spread that norm_target takes out of the target;
             # patches with under 2 in-mask voxels have no spread
@@ -290,6 +400,16 @@ class ViTMAE3D(nn.Module):
         self,
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B Ex Ey Ez D"]:
+        """Patch embeddings on the eval's 8 mm grid, which the frozen eval asserts. Other patch
+        sizes are interpolated onto it (to_eval_grid); 8 mm is dense_embed_native unchanged."""
+        embeds = self.dense_embed_native(images, mask)
+        return to_eval_grid(embeds, patchify3d(mask > 0, self.patch_size).any(dim=2), self.patch_size)
+
+    def dense_embed_native(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B Gx Gy Gz D"]:
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -318,10 +438,76 @@ class ViTMAE3D(nn.Module):
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B D"]:
-        embeds = self.dense_embed(images, mask).flatten(1, 3)
+        embeds = self.dense_embed_native(images, mask).flatten(1, 3)
         in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
         embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
         return embeds
+
+
+# the frozen eval probes an 8 mm patch grid (eval/probe.py PATCH_GRID_SHAPE, 24x30x24)
+EVAL_PATCH_SIZE = 8
+
+
+def to_eval_grid(
+    embeds: Float[Tensor, "B Gx Gy Gz D"],
+    in_mask: Bool[Tensor, "B N"],
+    patch_size: int,
+) -> Float[Tensor, "B Ex Ey Ez D"]:
+    """Trilinear interpolation of a patch_size grid onto the 8 mm eval grid, normalized by the
+    interpolated in-mask weight so empty patches (zeros) do not dim the edge of the head.
+    align_corners=False maps patch centres onto patch centres for any patch size."""
+    if patch_size == EVAL_PATCH_SIZE:
+        return embeds
+    B, *grid, D = embeds.shape
+    eval_grid = [size * patch_size // EVAL_PATCH_SIZE for size in grid]
+    weight = in_mask.reshape(B, 1, *grid).to(embeds.dtype)
+    x = torch.cat([embeds.permute(0, 4, 1, 2, 3) * weight, weight], dim=1)
+    x = F.interpolate(x, size=eval_grid, mode="trilinear", align_corners=False)
+    x, weight = x[:, :D], x[:, D:]
+    x = torch.where(weight > 0, x / weight.clamp_min(1e-6), 0.0)
+    return x.permute(0, 2, 3, 4, 1)
+
+
+def sigreg(
+    z: Float[Tensor, "N D"], num_slices: int = 1024, t_max: float = 3.0, num_points: int = 17
+) -> Tensor:
+    """LeJEPA's SIGReg: the Epps-Pulley normality statistic of z projected on num_slices random
+    unit directions, averaged over directions. Same math as the official lejepa code
+    (univariate/epps_pulley.py EppsPulley, multivariate/slicing.py SlicingUnivariateTest):
+    N * integral over t in [-3, 3] of |empirical char. function - exp(-t^2/2)|^2 exp(-t^2/2) dt,
+    trapezoid rule on 17 points of t >= 0 using the symmetry in t. Small for N(0, I) samples."""
+    directions = torch.randn(z.shape[-1], num_slices, device=z.device)
+    directions = directions / directions.norm(dim=0)
+    x = (z.float() @ directions)[..., None]  # [N, K, 1]
+    t = torch.linspace(0, t_max, num_points, device=z.device)
+    phi = torch.exp(-0.5 * t**2)
+    dt = t_max / (num_points - 1)
+    weights = torch.full((num_points,), 2 * dt, device=z.device)
+    weights[[0, -1]] = dt
+    xt = x * t
+    err = (xt.cos().mean(dim=0) - phi).square() + xt.sin().mean(dim=0).square()  # [K, P]
+    return (err @ (weights * phi)).mean() * z.shape[0]
+
+
+def split_subcubes(x: Float[Tensor, "B M P"], patch_size: int, sub: int) -> Float[Tensor, "B M S Q"]:
+    """Voxels of each patch (patchify3d order) regrouped into its sub^3 sub-cubes, in
+    meshgrid(ij) order of the sub-cube offsets, each in patchify3d order."""
+    q = patch_size // sub
+    return rearrange(
+        x,
+        "b m (ox qx oy qy oz qz) -> b m (ox oy oz) (qx qy qz)",
+        ox=sub, oy=sub, oz=sub, qx=q, qy=q, qz=q,
+    )
+
+
+def merge_subcubes(x: Float[Tensor, "B M S Q"], patch_size: int, sub: int) -> Float[Tensor, "B M P"]:
+    """Inverse of split_subcubes."""
+    q = patch_size // sub
+    return rearrange(
+        x,
+        "b m (ox oy oz) (qx qy qz) -> b m (ox qx oy qy oz qz)",
+        ox=sub, oy=sub, oz=sub, qx=q, qy=q, qz=q,
+    )
 
 
 def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:

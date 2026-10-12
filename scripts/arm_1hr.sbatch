@@ -62,19 +62,26 @@ if [[ $status -ne 0 && $status -ne 124 ]]; then
     exit $status
 fi
 
-# run evals if successful, ~6 min
-.venv/bin/python -m nanobrain.eval.run \
-    "${RUN_DIR}/checkpoint-last.pth" \
-    "${RUN_DIR}/eval"
+# run evals if successful, ~6 min. One task per call, so a probe fit that fails to converge
+# (ps/p16-w768 hippocampus, 2026-10-12) costs that task only
+TASKS="$(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASKS; print(*DEFAULT_TASKS)')"
+for task in ${TASKS}; do
+    if ! .venv/bin/python -m nanobrain.eval.run "${RUN_DIR}/checkpoint-last.pth" "${RUN_DIR}/eval" --tasks "${task}"; then
+        echo "FAILED eval ${task}" | tee -a "${RUN_DIR}/eval-failed.txt"
+    fi
+done
 
 # second score: layers 9 and 12 concatenated (N1, nanobrain-ideas.md section 0.10), ~12 min.
+# READOUT_LAYERS overrides the pair for other depths, e.g. READOUT_LAYERS="6 8" at depth 8.
 # Each task runs on its own so a failed probe fit costs that task only.
-READOUT_DIR="${RUN_DIR}/readout/cat9-12"
+READOUT_LAYERS="${READOUT_LAYERS:-9 12}"
+READOUT_NAME="cat${READOUT_LAYERS// /-}"
+READOUT_DIR="${RUN_DIR}/readout/${READOUT_NAME}"
 .venv/bin/python -m nanobrain.readout \
-    "${RUN_DIR}/checkpoint-last.pth" "${READOUT_DIR}/model.pth" --layers 9 12
+    "${RUN_DIR}/checkpoint-last.pth" "${READOUT_DIR}/model.pth" --layers ${READOUT_LAYERS}
 for task in $(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASKS; print(*DEFAULT_TASKS)'); do
     if ! .venv/bin/python -m nanobrain.eval.run "${READOUT_DIR}/model.pth" "${READOUT_DIR}" --tasks "${task}"; then
-        echo "FAILED cat9-12 ${task}" | tee -a "${RUN_DIR}/readout/failed.txt"
+        echo "FAILED ${READOUT_NAME} ${task}" | tee -a "${RUN_DIR}/readout/failed.txt"
     fi
 done
 rm "${READOUT_DIR}/model.pth"
@@ -88,3 +95,8 @@ for ckpt in "${RUN_DIR}"/checkpoint-ema*.pth; do
         echo "FAILED eval ${name}" | tee -a "${RUN_DIR}/readout/failed.txt"
     fi
 done
+
+# BRAINMARKS=1: brainmarks-smri on checkpoint-last, ~30 min (submit with --mem=96G --time=2:30:00)
+if [[ "${BRAINMARKS:-0}" == 1 ]]; then
+    bash scripts/brainmarks.sbatch "${RUN_DIR}/checkpoint-last.pth" "${RUN_DIR}" brainmarks
+fi

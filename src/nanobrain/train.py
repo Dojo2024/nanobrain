@@ -280,7 +280,7 @@ def train_one_epoch(
             batch = misc.send_data(batch, device)
 
         # run volume processing on gpu, not cpu workers
-        batch = default_collate([process_sample(sample) for sample in batch])
+        batch = default_collate([process_sample(s, intensity_aug=args.intensity_aug) for s in batch])
         images = batch["image"]
         masks = batch["mask"]
 
@@ -295,6 +295,10 @@ def train_one_epoch(
                 mask_groups=mask_groups,
                 norm_target=args.norm_target,
                 stats_weight=args.stats_weight,
+                layout_weight=args.layout_weight,
+                global_weight=args.global_weight,
+                sigreg_lambda=args.sigreg_lambda,
+                infonce_tau=args.infonce_tau,
             )
 
         loss_for_log = loss.detach()
@@ -358,6 +362,10 @@ def train_one_epoch(
                 mask_groups=mask_groups,
                 norm_target=args.norm_target,
                 stats_weight=args.stats_weight,
+                layout_weight=args.layout_weight,
+                global_weight=args.global_weight,
+                sigreg_lambda=args.sigreg_lambda,
+                infonce_tau=args.infonce_tau,
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)
@@ -429,6 +437,10 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
                 with_state=False,
                 norm_target=args.norm_target,
                 stats_weight=args.stats_weight,
+                layout_weight=args.layout_weight,
+                global_weight=args.global_weight,
+                sigreg_lambda=args.sigreg_lambda,
+                infonce_tau=args.infonce_tau,
             )
         loss.backward()
     model.zero_grad(set_to_none=True)
