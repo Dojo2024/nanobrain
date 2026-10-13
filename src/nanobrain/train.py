@@ -21,7 +21,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
 from nanobrain.data import BrainNpzDataset, process_sample
-from nanobrain.model import ViTMAE3D, make_mask_groups, patches_to_volume
+from nanobrain.model import ViTMAE3D, fine_patch_state_dict, make_mask_groups, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
@@ -113,25 +113,7 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
-    assert args.optimizer == "muon" or args.muon_impl == "torch", "muon_impl needs optimizer muon"
-    param_groups = misc.get_param_groups(
-        model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
-    )
-    misc.update_lr(param_groups, args.lr)
-    misc.update_wd(param_groups, args.weight_decay)
-    # cast or else it corrupts the checkpoint
-    betas = tuple(args.betas) if args.betas is not None else None
-    if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
-    else:
-        assert args.optimizer == "muon", args.optimizer
-        optimizer = misc.MuonAdamW(
-            param_groups, betas=betas, fused=args.fused_adamw, impl=args.muon_impl
-        )
-        num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
-        num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
-        logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M")
+    optimizer = make_optimizer(args, model)
 
     epoch_num_batches = len(train_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -169,6 +151,12 @@ def main(args: DictConfig):
     assert not (args.ema_decays and args.start_epoch), "an ema run can't resume"
     ema = misc.ModelEMA(model, args.ema_decays) if args.ema_decays else None
 
+    # P7 patch-size switch (default_pretrain.yaml switch_min)
+    if args.switch_min:
+        sub = args.model_kwargs.decoder_sub
+        assert sub * args.switch_patch_size == args.patch_size, "the switch needs decoder_sub"
+        assert not args.ema_decays and not args.start_epoch, "a switch run has no ema, can't resume"
+
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
     # with a time budget, epochs run until the budget runs out
@@ -178,6 +166,21 @@ def main(args: DictConfig):
         assert not args.stop_epoch or args.stop_epoch <= args.epochs, "stop_epoch is past epochs"
         epochs = range(args.start_epoch, args.stop_epoch or args.epochs)
     for epoch in epochs:
+        if args.switch_min and args.patch_size != args.switch_patch_size:
+            if time.monotonic() - start_time >= 60 * args.switch_min:
+                model = switch_patch_size(args, model, device)
+                batch_flops = count_batch_flops(args, model, device)
+                if args.compile:
+                    # fresh compile caches: the token counts change (e.g. 168 -> 1280), which
+                    # would otherwise make dynamo recompile with dynamic shapes
+                    torch._dynamo.reset()
+                    model.compile()
+                optimizer = make_optimizer(args, model)
+                logger.info(
+                    f"epoch {epoch}: switched to patch {args.patch_size}, "
+                    f"{args.num_visible} visible / {args.num_predict} predicted, "
+                    f"flops per batch {batch_flops / 1e12:.2f} TFLOP"
+                )
         train_stats = train_one_epoch(
             args,
             model,
@@ -206,6 +209,41 @@ def main(args: DictConfig):
     total_time = time.monotonic() - start_time
     logger.info(f"done! training time: {datetime.timedelta(seconds=int(total_time))}")
 
+
+def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
+    assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
+    assert args.optimizer == "muon" or args.muon_impl == "torch", "muon_impl needs optimizer muon"
+    param_groups = misc.get_param_groups(
+        model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
+    )
+    misc.update_lr(param_groups, args.lr)
+    misc.update_wd(param_groups, args.weight_decay)
+    # cast or else it corrupts the checkpoint
+    betas = tuple(args.betas) if args.betas is not None else None
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    else:
+        assert args.optimizer == "muon", args.optimizer
+        optimizer = misc.MuonAdamW(
+            param_groups, betas=betas, fused=args.fused_adamw, impl=args.muon_impl
+        )
+        num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
+        num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
+        logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M")
+    return optimizer
+
+
+def switch_patch_size(args: DictConfig, model: nn.Module, device: torch.device) -> nn.Module:
+    """P7: the same model at args.switch_patch_size with the plain decoder, from the current weights
+    (model.fine_patch_state_dict). args is updated in place, so checkpoints saved from here on
+    rebuild the fine model."""
+    args.patch_size = args.switch_patch_size
+    args.num_visible = args.switch_num_visible
+    args.num_predict = args.switch_num_predict
+    args.model_kwargs.decoder_sub = 1
+    fine = ViTMAE3D.from_config(args)
+    fine.load_state_dict(fine_patch_state_dict(model, fine))
+    return fine.to(device)
 
 def train_one_epoch(
     args: DictConfig,
@@ -284,6 +322,12 @@ def train_one_epoch(
         images = batch["image"]
         masks = batch["mask"]
 
+        # P33: the global loss stays off for the first global_start_min minutes
+        global_weight = args.global_weight
+        elapsed = time.monotonic() - start_time
+        if args.global_start_min and elapsed < 60 * args.global_start_min:
+            global_weight = 0.0
+
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -296,7 +340,7 @@ def train_one_epoch(
                 norm_target=args.norm_target,
                 stats_weight=args.stats_weight,
                 layout_weight=args.layout_weight,
-                global_weight=args.global_weight,
+                global_weight=global_weight,
                 sigreg_lambda=args.sigreg_lambda,
                 infonce_tau=args.infonce_tau,
                 spectral_weight=args.spectral_weight,

@@ -501,6 +501,31 @@ def to_eval_grid(
     return x.permute(0, 2, 3, 4, 1)
 
 
+def fine_patch_state_dict(model: "ViTMAE3D", fine: "ViTMAE3D") -> dict[str, Tensor]:
+    """P7: weights of a model at patch p with the sub-token decoder (decoder_sub s) for `fine`, the
+    same model at patch p / s with the plain decoder, so training can continue on the finer grid.
+    - patch_embed: fine.patch_embed(x) == model.patch_embed(x nearest-upsampled to p^3), i.e. each
+      s^3 block of the coarse input weights is summed
+    - position tables (encoder and decoder input): linear interpolation onto the fine grid,
+      align_corners=False, which puts each fine patch centre at its place in the coarse grid
+    - decoder_head: the sub-token head already predicts (p / s)^3 voxels, so it is kept with the
+      decoder blocks and norm; the sub-token stage (unshuffle, sub position table, sub blocks, sub
+      norm) is dropped
+    Everything else (class tokens, encoder blocks, global projector) is copied."""
+    s, p = model.decoder_sub, fine.patch_size
+    assert s > 1 and p * s == model.patch_size and fine.decoder_sub == 1, (model.patch_size, s, p)
+    sub_stage = ("decoder_unshuffle.", "decoder_sub_pos_embed.", "decoder_sub_blocks.", "decoder_sub_norm.")
+    state = {k: v for k, v in model.state_dict().items() if not k.startswith(sub_stage)}
+    weight = state["patch_embed.weight"].reshape(-1, p, s, p, s, p, s)
+    state["patch_embed.weight"] = weight.sum(dim=(2, 4, 6)).reshape(-1, p**3)
+    for name in ("pos_embed", "decoder_pos_embed"):
+        for axis, size in zip("xyz", getattr(fine, name).grid_size):
+            table = state[f"{name}.weight_{axis}"]  # (coarse size, D)
+            table = F.interpolate(table.T[None], size=size, mode="linear", align_corners=False)
+            state[f"{name}.weight_{axis}"] = table[0].T.contiguous()
+    return state
+
+
 def spectral_loss(
     pred: Float[Tensor, "B M V"],
     target: Float[Tensor, "B M V"],

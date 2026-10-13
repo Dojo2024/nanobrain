@@ -52,6 +52,17 @@ infonce_tau: 0.07
 # weighted squared difference of log1p Fourier magnitudes, in-mask voxels only (model.spectral_loss).
 # 0 disables. Our notes' D1 arm uses 0.1; the smoke test measures the term's size after training.
 spectral_weight: 0.0
+# P33: minutes of training before the global loss (model_kwargs.global_loss) switches on; null = from
+# the start. The projector exists from the start and gets no gradient until then.
+global_start_min: null
+# P7: at the first epoch boundary after switch_min minutes, a model trained at patch_size with the
+# sub-token decoder (decoder_sub = patch_size / switch_patch_size) continues at switch_patch_size
+# with the plain decoder and switch_num_visible / switch_num_predict (model.fine_patch_state_dict).
+# The optimizer restarts; the lr schedule continues. null = no switch.
+switch_min: null
+switch_patch_size: 8
+switch_num_visible: 1280
+switch_num_predict: 1280
 
 # Model (ViT-S encoder).
 model_kwargs:
