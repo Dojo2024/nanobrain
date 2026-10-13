@@ -57,10 +57,14 @@ timeout --kill-after=2m "7h" \
     train_filelist="${DATA_ROOT}/filelist_subsampled.txt" \
     "$@"
 
-# default eval on the final checkpoint, ~6 min
-.venv/bin/python -m nanobrain.eval.run \
-    "${RUN_DIR}/checkpoint-last.pth" \
-    "${RUN_DIR}/eval"
+# default eval on the final checkpoint, ~6 min. One task per call, so a probe fit that fails to
+# converge costs that task only (as arm_1hr.sbatch)
+TASKS="$(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASKS; print(*DEFAULT_TASKS)')"
+for task in ${TASKS}; do
+    if ! .venv/bin/python -m nanobrain.eval.run "${RUN_DIR}/checkpoint-last.pth" "${RUN_DIR}/eval" --tasks "${task}"; then
+        echo "FAILED eval ${task}" | tee -a "${RUN_DIR}/eval-failed.txt"
+    fi
+done
 
 # layers 9 and 12 concatenated, as arm_1hr.sbatch, ~12 min
 # Each task runs on its own so a failed probe fit costs that task only.
@@ -81,3 +85,8 @@ for epoch in 10 20 30; do
         echo "FAILED eval ep${epoch}" | tee -a "${RUN_DIR}/readout/failed.txt"
     fi
 done
+
+# BRAINMARKS=1: brainmarks-smri on checkpoint-last, ~30 min (submit with --mem=96G)
+if [[ "${BRAINMARKS:-0}" == 1 ]]; then
+    bash scripts/brainmarks.sbatch "${RUN_DIR}/checkpoint-last.pth" "${RUN_DIR}" brainmarks
+fi
