@@ -63,6 +63,14 @@ switch_min: null
 switch_patch_size: 8
 switch_num_visible: 1280
 switch_num_predict: 1280
+# SiamJEPA (model_kwargs.objective: siamjepa; model.forward_siamjepa): weight of the KL between the
+# students' latent posterior and prior (paper 0.01; 1e-5 is its JEPA-like baseline), EMA momentum of
+# the teacher (paper 0.99 for its first 200 epochs, ~31k steps, about our 1 h at 16 mm), and minutes
+# of Random Shuffle Teacher from the start (0 = off). num_visible is per student view, num_predict
+# the targets hidden from both.
+siam_kl_scale: 0.01
+teacher_momentum: 0.99
+rst_min: 0
 
 # Model (ViT-S encoder).
 model_kwargs:
@@ -89,6 +97,9 @@ model_kwargs:
   global_hidden_dim: 2048
   global_proj_dim: 256
   sigreg_slices: 1024
+  objective: mae
+  siam_stoch: 32
+  siam_discrete: 32
   # self: MAE decoder over visible + mask tokens. cross: mask tokens cross-attend to the visible
   # embeddings only (CrossMAE), ~0.4x the decoder flops at 1280 visible / 1280 predicted.
   decoder_type: self

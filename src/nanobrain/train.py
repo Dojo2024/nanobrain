@@ -327,6 +327,8 @@ def train_one_epoch(
         elapsed = time.monotonic() - start_time
         if args.global_start_min and elapsed < 60 * args.global_start_min:
             global_weight = 0.0
+        # SiamJEPA Random Shuffle Teacher for the first rst_min minutes
+        shuffle_teacher = bool(args.rst_min) and elapsed < 60 * args.rst_min
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
@@ -344,6 +346,8 @@ def train_one_epoch(
                 sigreg_lambda=args.sigreg_lambda,
                 infonce_tau=args.infonce_tau,
                 spectral_weight=args.spectral_weight,
+                siam_kl_scale=args.siam_kl_scale,
+                shuffle_teacher=shuffle_teacher,
             )
 
         loss_for_log = loss.detach()
@@ -359,6 +363,8 @@ def train_one_epoch(
 
         if need_update and ema is not None:
             ema.update()
+        if need_update and args.model_kwargs.objective == "siamjepa":
+            model.update_teacher(args.teacher_momentum)
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
@@ -390,6 +396,8 @@ def train_one_epoch(
     # plot a few images from the last batch
     num_examples = args.plot_nrow * args.plot_ncol
     is_plot_epoch = args.plot_period and (epoch % args.plot_period == 0 or epoch == args.epochs - 1)
+    # SiamJEPA predicts teacher features, not voxels, so there is nothing to plot
+    is_plot_epoch = is_plot_epoch and args.model_kwargs.objective == "mae"
     if num_examples and is_plot_epoch:
         model.eval()
         example_images = images[:num_examples]

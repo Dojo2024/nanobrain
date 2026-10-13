@@ -1,3 +1,4 @@
+import copy
 import math
 
 import torch
@@ -48,6 +49,9 @@ class ViTMAE3D(nn.Module):
         global_hidden_dim: int = 2048,
         global_proj_dim: int = 256,
         sigreg_slices: int = 1024,
+        objective: str = "mae",
+        siam_stoch: int = 32,
+        siam_discrete: int = 32,
     ):
         super().__init__()
         assert decoder_type in ("self", "cross"), decoder_type
@@ -178,6 +182,30 @@ class ViTMAE3D(nn.Module):
         self.stats_head = stats_head
         self.layout_head = layout_head
         num_aux = 2 if stats_head else 16 if layout_head else 0
+        # SiamJEPA (Yamada, arXiv 2607.04044, github.com/oist/SiamJEPA): two students with disjoint
+        # visible patches predict an EMA teacher's features of patches hidden from both, through
+        # the decoder with a feature head; a latent Z couples the two students (forward_siamjepa)
+        assert objective in ("mae", "siamjepa"), objective
+        self.objective = objective
+        if objective == "siamjepa":
+            assert class_tokens == 1 and decoder_sub == 1 and decoder_type == "self", "siamjepa"
+            assert not (stats_head or layout_head or self.hc_rate or frac_connections), "siamjepa"
+            assert global_loss == "none", "siamjepa"
+            head_dim = embed_dim
+            E, Z = embed_dim, siam_stoch * siam_discrete
+            self.siam_stoch, self.siam_discrete = siam_stoch, siam_discrete
+            # the paper's linear map h (ca3 in the code), on every student token
+            self.siam_h = nn.Linear(E, E)
+            self.siam_projector = nn.Sequential(
+                nn.Linear(E, E), nn.BatchNorm1d(E), nn.ReLU(),
+                nn.Linear(E, E), nn.BatchNorm1d(E), nn.ReLU(),
+                nn.Linear(E, E),
+            )
+            self.siam_posterior = nn.Sequential(
+                nn.Linear(2 * E, 2 * E), nn.ReLU(), nn.Linear(2 * E, Z)
+            )
+            self.siam_prior = nn.Sequential(nn.Linear(E, 2 * E), nn.ReLU(), nn.Linear(2 * E, Z))
+            self.siam_z_embed = nn.Linear(Z, decoder_embed_dim)
         self.decoder_head = nn.Linear(decoder_embed_dim, head_dim + num_aux)
 
         # global_loss (L8): a loss on the mean of each sequence's visible encoder tokens (the same
@@ -225,6 +253,13 @@ class ViTMAE3D(nn.Module):
         self.register_buffer("spectral_mask", highpass_mask, persistent=False)
 
         self.init_weights()
+        if objective == "siamjepa":
+            # EMA teacher: a frozen copy of the encoder, moved toward it by update_teacher
+            parts = {name: copy.deepcopy(getattr(self, name)) for name in TEACHER_PARTS}
+            self.teacher = nn.ModuleDict(parts)
+            self.teacher_cls_token = nn.Parameter(self.cls_token.detach().clone())
+            self.teacher.requires_grad_(False)
+            self.teacher_cls_token.requires_grad_(False)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -242,8 +277,109 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             nn.init.normal_(self.cls_token, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)
-        # initialize the decoder head to zero to prevent hockey stick
-        self.decoder_head.weight.data.mul_(0.0)
+        # initialize the decoder head to zero to prevent hockey stick. Not for SiamJEPA: its
+        # predictions are L2-normalized, and normalizing zeros gives ~1e12 gradients at step 0
+        if self.objective == "mae":
+            self.decoder_head.weight.data.mul_(0.0)
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float) -> None:
+        """SiamJEPA: teacher = momentum * teacher + (1 - momentum) * student, after each step."""
+        student = [p for name in TEACHER_PARTS for p in getattr(self, name).parameters()]
+        teacher = list(self.teacher.parameters())
+        assert len(student) == len(teacher)
+        student, teacher = student + [self.cls_token], teacher + [self.teacher_cls_token]
+        torch._foreach_mul_(teacher, momentum)
+        torch._foreach_add_(teacher, student, alpha=1 - momentum)
+
+    @torch.no_grad()
+    def forward_teacher(
+        self,
+        patches: Float[Tensor, "B N P"],
+        coord: Float[Tensor, "B N 3"],
+    ) -> Float[Tensor, "B N D"]:
+        teacher = self.teacher
+        x = teacher["pos_embed"](teacher["patch_embed"](patches), coord)
+        x = torch.cat([self.teacher_cls_token.expand(x.shape[0], -1, -1), x], dim=1)
+        for block in teacher["blocks"]:
+            x = block(x)
+        return teacher["norm"](x)[:, 1:]
+
+    def forward_siamjepa(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+        num_visible: int,
+        num_predict: int,
+        kl_scale: float,
+        shuffle_teacher: bool,
+    ) -> Float[Tensor, ""]:
+        """SiamJEPA loss, following github.com/oist/SiamJEPA (models_siamjepa.py):
+        - one shuffle of the in-mask patches per image: student view 1 sees the first num_visible,
+          view 2 the next num_visible, and the targets are the next num_predict, hidden from both
+          (random_masking_dual without its square block). One encoder runs both views.
+        - the EMA teacher sees all of those patches; its final-norm patch features are the targets.
+          With shuffle_teacher (Random Shuffle Teacher) they are permuted per image and never put
+          back, so each target is another patch's feature.
+        - predictor: student tokens through h, decoder_proj, a token embedding Z, mask tokens at
+          the target positions, the decoder blocks, decoder_head to the teacher's width.
+          Loss 2 - 2 cos(prediction, target) over in-mask targets, both views.
+        - Z: 32 categorical variables of 32 classes, straight-through sample of the posterior
+          q(Z | proj(h(cls own view)), proj(cls other view)); prior p(Z | sg(proj(h(cls own)))).
+          KL balanced 0.2 posterior / 0.8 prior, free bits 0.1 per view, weight kl_scale."""
+        B = images.shape[0]
+        V, P = num_visible, num_predict
+        patches = patchify3d(images, self.patch_size)
+        mask_patches = patchify3d(mask, self.patch_size)
+        coord = self.coord_grid.expand(B, -1, -1)
+        order = sample_sequences(mask_patches, 1, 2 * V + P)[:, 0]
+        batch_ids = torch.arange(B, device=images.device)[:, None]
+        patches, coord = patches[batch_ids, order], coord[batch_ids, order]
+        # the same in-mask rule as sample_sequences: volumes with too few mask patches fill the
+        # tail of the order with outside patches, which are not targets
+        valid = mask_patches[batch_ids, order[:, 2 * V :]].mean(dim=-1) >= 0.25
+
+        target = self.forward_teacher(patches, coord)
+        if shuffle_teacher:
+            perm = torch.rand(B, target.shape[1], device=images.device).argsort(dim=1)
+            target = target[batch_ids, perm]
+        target = target[:, 2 * V :]
+
+        views = torch.cat([patches[:, :V], patches[:, V : 2 * V]])
+        embeds = self.forward_encoder(views, torch.cat([coord[:, :V], coord[:, V : 2 * V]]))
+        hidden = self.siam_h(embeds)
+
+        # Z for view 1 sees view 2's class token and vice versa (rows B: are view 2)
+        own = self.siam_projector(hidden[:, 0])
+        other = self.siam_projector(embeds[:, 0].roll(B, dims=0))
+        shape = (2 * B, self.siam_stoch, self.siam_discrete)
+        post = self.siam_posterior(torch.cat([own, other], dim=-1))
+        post = post.float().clamp(-20, 20).view(shape)
+        prior = self.siam_prior(own.detach()).float().clamp(-20, 20).view(shape)
+        post, prior = post.log_softmax(dim=-1), prior.log_softmax(dim=-1)
+        gumbel = -torch.log(-torch.log(torch.rand_like(post).clamp_min(1e-20)))
+        one_hot = F.one_hot((post + gumbel).argmax(dim=-1), self.siam_discrete).to(post.dtype)
+        z = one_hot + post.exp() - post.exp().detach()
+        kl_post = (post.exp() * (post - prior.detach())).sum(dim=(1, 2))
+        kl_prior = (post.exp().detach() * (post.detach() - prior)).sum(dim=(1, 2))
+        kl = 0.2 * kl_post + 0.8 * kl_prior
+        kl_loss = (kl[:B].mean().clamp_min(0.1) + kl[B:].mean().clamp_min(0.1)) / 2
+
+        x = self.decoder_proj(hidden)
+        z_token = self.siam_z_embed(z.flatten(1).to(x.dtype))[:, None]
+        target_coord = coord[:, 2 * V :].repeat(2, 1, 1)
+        mask_tokens = self.decoder_pos_embed(self.mask_token.expand(2 * B, P, -1), target_coord)
+        x = torch.cat([z_token, x, mask_tokens], dim=1)
+        for block in self.decoder_blocks:
+            x = block(x)
+        pred = self.decoder_head(self.decoder_norm(x[:, -P:]))
+
+        pred = F.normalize(pred.float(), dim=-1)
+        target = F.normalize(target.float(), dim=-1).repeat(2, 1, 1)
+        sim = 2 - 2 * (pred * target).sum(dim=-1).clamp(-1, 1)
+        weight = valid.repeat(2, 1).to(sim.dtype)
+        loss = (sim * weight).sum() / weight.sum().clamp_min(1)
+        return loss + kl_scale * kl_loss
 
     def forward_encoder(
         self,
@@ -323,7 +459,14 @@ class ViTMAE3D(nn.Module):
         sigreg_lambda: float = 0.05,
         infonce_tau: float = 0.07,
         spectral_weight: float = 0.0,
+        siam_kl_scale: float = 0.01,
+        shuffle_teacher: bool = False,
     ):
+        if self.objective == "siamjepa":
+            loss = self.forward_siamjepa(
+                images, mask, num_visible, num_predict, siam_kl_scale, shuffle_teacher
+            )
+            return loss if not with_state else (loss, {})
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
@@ -475,6 +618,10 @@ class ViTMAE3D(nn.Module):
         in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
         embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
         return embeds
+
+
+# the encoder parts the SiamJEPA teacher copies (update_teacher pairs their parameters by order)
+TEACHER_PARTS = ("patch_embed", "pos_embed", "blocks", "norm")
 
 
 # the frozen eval probes an 8 mm patch grid (eval/probe.py PATCH_GRID_SHAPE, 24x30x24)
