@@ -239,8 +239,9 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
 | Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **null**, keep the plain readout: rank 2.18 / 2.23 vs 2.14; pool CNP +.011 (4/4, the one effect seen in all 3 P20 tests); layers 9+12 CNP/IDH/UPENN +.005–.006 (4/4) but ABIDE −.016 (0/4) |
 | A2: spectral loss (SL-MAE, per patch) | `a2/spec0.1-w512`, `a2/spec0.5-w512` | **null to negative, not adopted**: FOMO tumor −.009/−.011, PMG −.020/−.013, hippocampus −.003/−.009 (0/4 at 0.5), thin structures flat; brainmarks rank 2.73 / 2.86 (control 2.73), 0.5 costs segmentation (WT −.005, 2/2 significant) |
-| P33: InfoNCE switched on at 45 min, on width 1024 | `p33/w1024-infonce-late45` | **running** (jobs 530271–74) |
-| P7: 16 mm for 30 min, then 8 mm (w512) | `p7/w512-switch30` | **running** (jobs 530275–78) |
+| P33: InfoNCE switched on at 45 min, on width 1024 | `p33/w1024-infonce-late45` | FOMO vs `ps16/w1024-sub2`: PMG −.036 (0/4), lesion −.007 (cat9-12 −.019), rest ±.005; brainmarks 8/11 tasks so far: CNP −.014, IXI −.015, OpenBHB −.015, segmentation ±.005 — leaning negative |
+| SiamJEPA / SiamJEPA + RST, default width, 16 mm | `siamjepa/plain`, `siamjepa/rst` | **running** (530385–92, submitted by the user); smoke 530356 OK: 270 / 236 vol/s, 10.9 GB, loss 2.03 → ~0.6 |
+| P7: 16 mm for 30 min, then 8 mm (w512) | `p7/w512-switch30` | **negative**: 10–11 epochs at 16 mm + 5–6 at 8 mm; FOMO vs `n11/width512` all down (hippocampus −.014, cortex −.010, tumor −.015, PMG −.040; 0–1/4); brainmarks rank 2.77 (control 2.73), segmentation −.015 to −.033 (2/2 significant), whole-scan flat. The switch itself works (177–179 vol/s after it) |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
