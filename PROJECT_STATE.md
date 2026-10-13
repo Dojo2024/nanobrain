@@ -238,7 +238,9 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
 | Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **null**, keep the plain readout: rank 2.18 / 2.23 vs 2.14; pool CNP +.011 (4/4, the one effect seen in all 3 P20 tests); layers 9+12 CNP/IDH/UPENN +.005–.006 (4/4) but ABIDE −.016 (0/4) |
-| A2: spectral loss (SL-MAE, per patch) | `spectral_weight`, `experiments/dojo_1h/spectral/` | **running** (jobs 530150–57): `a2/spec0.1-w512`, `a2/spec0.5-w512` × 4 seeds, `BRAINMARKS=1`, vs `n11/width512`; implemented by the user's coder, fixed 2026-10-13 (mask to head, log1p, float32 FFT) |
+| A2: spectral loss (SL-MAE, per patch) | `a2/spec0.1-w512`, `a2/spec0.5-w512` | **null to negative, not adopted**: FOMO tumor −.009/−.011, PMG −.020/−.013, hippocampus −.003/−.009 (0/4 at 0.5), thin structures flat; brainmarks rank 2.73 / 2.86 (control 2.73), 0.5 costs segmentation (WT −.005, 2/2 significant) |
+| P33: InfoNCE switched on at 45 min, on width 1024 | `p33/w1024-infonce-late45` | **running** (jobs 530271–74) |
+| P7: 16 mm for 30 min, then 8 mm (w512) | `p7/w512-switch30` | **running** (jobs 530275–78) |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
@@ -290,6 +292,13 @@ Score with `paired.py ps16/w1024-sub2 ps16/w1024-sub2 --variant brainmarks-brain
 A fully trained MSE-only model still has a large spectral error, so the term asks for something MSE does not give. At a trained MSE of ~.4, weight 0.1 makes it ~15–23% of the loss and 0.5 about equal to the MSE.
 
 **Running (submitted 2026-10-13 ~08:30): A2 spectral loss, 8 jobs.** `BRAINMARKS=1 sbatch --mem=96G --time=2:30:00 scripts/arm_1hr.sbatch a2/spec<w>-w512 <seed> base_lr=0.003 optimizer=muon muon_impl=batched norm_target=true model_kwargs.embed_dim=512 model_kwargs.num_heads=8 spectral_weight=<w>`, w ∈ {0.1, 0.5}, seeds 7338 1 2 3 (jobs 530150–53 = 0.1, 530154–57 = 0.5). Score with `paired.py a2/spec<w>-w512 n11/width512`; the control has brainmarks on s7338 and s1 only, so brainmarks pairs on those 2 seeds (all 4 seeds still get a rank vs the references).
+
+**A2 RESULT (2026-10-13 ~10:40), 4 seeds vs `n11/width512`: null to negative, not adopted.** 12–13 epochs (172 vs 177 vol/s). FOMO last layer, w=0.1 / 0.5: lesion −.003 / +.004, tumor −.009 (1/4) / −.011 (1/4), age −.005 (0/4) / −.004, hippocampus −.003 / −.009 (0/4), PMG −.020 (0/4) / −.013, cortex, nerve and vessel ±.001. cat9-12 at 0.5: lesion +.011 (3/4), hippocampus −.010 (0/4). Brainmarks (2 control seeds): rank 2.73 / 2.86 (control 2.73); IDH +.013 / +.009, mRS +.009 / +.010, OpenBHB +.019 / +.011, IXI −.019 / −.022; at 0.5 segmentation drops (WT −.005, 2/2 significant). Training lowers the spectral error (~.94 → ~.4) but the frozen probes do not gain; the paper's gains were fine-tuned, 300 epochs, full-volume.
+
+**Running (submitted 2026-10-13 ~10:35): P33 and P7, 8 jobs, `BRAINMARKS=1`, 96G, 2:30.**
+- P33 `p33/w1024-infonce-late45` (530271–74): the `ps16/w1024-sub2` recipe + `model_kwargs.global_loss=infonce global_weight=0.1 global_start_min=45`. Compare with `ps16/w1024-sub2` (and `ps16/sub2-infonce`, on from the start, at w768).
+- P7 `p7/w512-switch30` (530275–78): FM w512 at `patch_size=16 num_visible=168 num_predict=168 model_kwargs.decoder_sub=2 model_kwargs.decoder_sub_depth=1 switch_min=30`; it continues at 8 mm (1280/1280, plain decoder) from the first epoch boundary after 30 min. `log.txt` says `switched to patch 8` at the switch. The final checkpoint is an 8 mm model. Compare on FOMO with `n11/width512` (and `n23/w768-d8`), on brainmarks with the 5 references (and `n11/width512`, `ps/p16`).
+- Code: `train.switch_patch_size`, `train.make_optimizer`, `model.fine_patch_state_dict`; CPU checks `experiments/dojo_1h/patchsize/check_switch.py`.
 
 ## 9. Offered, not yet approved by the user
 
