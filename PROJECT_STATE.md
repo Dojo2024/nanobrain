@@ -238,7 +238,7 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
 | Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **null**, keep the plain readout: rank 2.18 / 2.23 vs 2.14; pool CNP +.011 (4/4, the one effect seen in all 3 P20 tests); layers 9+12 CNP/IDH/UPENN +.005–.006 (4/4) but ABIDE −.016 (0/4) |
-| A2: spectral loss (SL-MAE, per patch) | `spectral_weight`, `experiments/dojo_1h/spectral/` | **ready, not yet run**: implemented by the user's coder, fixed 2026-10-13 (mask to head, log1p, float32 FFT); GPU smoke OK (175 vol/s, no slowdown); proposed arm 8 mm vs `n11/width512` |
+| A2: spectral loss (SL-MAE, per patch) | `spectral_weight`, `experiments/dojo_1h/spectral/` | **running** (jobs 530150–57): `a2/spec0.1-w512`, `a2/spec0.5-w512` × 4 seeds, `BRAINMARKS=1`, vs `n11/width512`; implemented by the user's coder, fixed 2026-10-13 (mask to head, log1p, float32 FFT) |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
@@ -288,6 +288,8 @@ Score with `paired.py ps16/w1024-sub2 ps16/w1024-sub2 --variant brainmarks-brain
 - `n11/width512` s7338 (1 h, trained without the term): MSE .412, spectral .940
 
 A fully trained MSE-only model still has a large spectral error, so the term asks for something MSE does not give. At a trained MSE of ~.4, weight 0.1 makes it ~15–23% of the loss and 0.5 about equal to the MSE.
+
+**Running (submitted 2026-10-13 ~08:30): A2 spectral loss, 8 jobs.** `BRAINMARKS=1 sbatch --mem=96G --time=2:30:00 scripts/arm_1hr.sbatch a2/spec<w>-w512 <seed> base_lr=0.003 optimizer=muon muon_impl=batched norm_target=true model_kwargs.embed_dim=512 model_kwargs.num_heads=8 spectral_weight=<w>`, w ∈ {0.1, 0.5}, seeds 7338 1 2 3 (jobs 530150–53 = 0.1, 530154–57 = 0.5). Score with `paired.py a2/spec<w>-w512 n11/width512`; the control has brainmarks on s7338 and s1 only, so brainmarks pairs on those 2 seeds (all 4 seeds still get a rank vs the references).
 
 ## 9. Offered, not yet approved by the user
 
