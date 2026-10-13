@@ -229,8 +229,9 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P14: sub-token decoder (16 mm token decoded as 8× 8 mm) | `ps16/w768-sub2` | small consistent positive, **best 16 mm** |
 | P14: layout head (octant mean / log std) | `ps16/w768-layout` | mixed (FOMO lesion +.038, PMG −.011) |
 | L8: SIGReg β 0.1 / 1, InfoNCE | `ps16/sub2-sigreg-b0.1`, `-b1`, `-infonce` | not adopted |
-| P20: brain-only readout | `brainmarks-brainpool/`, `brainmarks-brainstrip/` | **running** |
-| Width 1024 at 16 mm | `ps16/w1024-sub2` | **running** |
+| P20: brain-only readout, `pool` | `brainmarks-brainpool/` | small, not significant: CNP/OpenBHB up at both grids; rank 2.09 vs 2.32 (16 mm), 2.73 vs 2.86 (8 mm), same 2 seeds |
+| P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
+| Width 1024 at 16 mm | `ps16/w1024-sub2` | FOMO small positive vs w768-sub2 (lesion +.011, tumor/age +.007 4/4); brainmarks **running** |
 
 ## 8. Running now (submitted 2026-10-13, all started by ~05:00)
 
@@ -247,11 +248,14 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 
 On an IXI scan, cos(none, pool) = .926 and cos(none, strip) = .885. So the modes really change the embedding.
 
-**Partial P20 result (pool, 05:30):** about null so far.
-- `ps16/w768-sub2`, 2 seeds: CNP +.014, OpenBHB +.014, everything else within ±.004. No seed's paired CI excludes 0.
-- `n23/w768-d8`, s7338 only: CNP +.026, OpenBHB +.017, IXI −.012.
+**P20 result (06:15, 2 seeds each, paired against the plain readout on the same seeds):**
+- `pool`, 16 mm: CNP +.014, OpenBHB +.014, everything else within ±.004. No seed's paired CI excludes 0. Rank 2.09 vs 2.32.
+- `pool`, 8 mm `n23/w768-d8`: CNP +.031, OpenBHB +.011, IXI −.015. Rank 2.73 vs 2.86.
+- `strip`, 16 mm: IXI −.044 and OpenBHB −.041 (both seeds significant), CNP −.022, ABIDE −.013; lesion +.012 and WT +.006 (2/2). Rank 2.73.
+- `strip`, 8 mm: IXI −.035, OpenBHB −.018, lesion +.011. Rank 3.00.
+- Reading: our models were trained on whole heads, so skull-stripped inputs are out of distribution and age loses the head context. Brain-only pooling is cheap and leans positive but is inside the noise.
 
-**Width-1024 caveat.** s7338 trains slower than the other seeds (epoch 6 vs 9 at ~31 min), because it shares node n-7 with job 529902. It will finish with fewer epochs, so check the epochs column.
+**Width 1024 (FOMO, 4 seeds vs `ps16/w768-sub2`):** 18/20/21/21 epochs at 272–299 vol/s (same as width 768: loader-bound, so the width is free). Last layer: lesion +.011 (3/4), tumor +.007 (4/4), age +.007 (4/4), PMG +.010 (2/4), cortex +.001. cat9-12: lesion +.024 (3/4). Hippocampus fails to converge, as at width 768. Brainmarks still running.
 
 **How to score when done.**
 - `summarize.py` gives the brainmarks rank of the `brainpool` and `brainstrip` rows. Pool rows copy the segmentation cells from the same seeds' plain run.
