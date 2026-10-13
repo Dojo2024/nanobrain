@@ -30,6 +30,7 @@ export VIRTUAL_ENV=
 DATA_ROOT="/data/nanobrain/FOMO300K_images"
 OUT_DIR="/data/dojo/nanobrain/output"
 NAME="spectral-smoke/w0.1"
+mkdir -p "${OUT_DIR}/spectral-smoke"
 
 .venv/bin/python -m nanobrain.train --overrides \
     name="${NAME}" output_dir="${OUT_DIR}" seed=0 print_freq=50 stop_epoch=1 \
