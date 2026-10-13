@@ -31,12 +31,23 @@ from nanobrain.eval.prepare import GRID_FOV, VMAX_QUANTILE, VMIN_QUANTILE, trunc
 from nanobrain.eval.run import load_model
 from nanobrain.model import patchify3d
 
+# brain_mode (P20, nanobrain-ideas.md 3c), using brainmarks' brain_mask:
+#   none: the head mask as in nanobrain's own eval
+#   pool: input unchanged; the global embedding is the mean of patches with any brain voxel
+#     (from dense_embed_native, so a readout's separate global layers are not used)
+#   strip: skull-stripped input (zero outside the brain, z-scored inside it); tokens, the
+#     global mean and the dense mask are the brain patches
+BRAIN_MODES = ("none", "pool", "strip")
+
+
 class Nanobrain(nn.Module):
     name = "nanobrain"
 
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, brain_mode: str = "none"):
         super().__init__()
+        assert brain_mode in BRAIN_MODES, brain_mode
         self.model = model
+        self.brain_mode = brain_mode
         # a readout concatenates its layers; plain ViTMAE3D has no readout_layers
         num_layers = len(getattr(model, "readout_layers", (12,)))
         concat = getattr(model, "readout_combine", "cat") == "cat"
@@ -60,12 +71,17 @@ class Nanobrain(nn.Module):
         fit_mask = np.asarray(resample_from_to(mask_img, fit_img, order=0).dataobj) > 0
         fit_mask_img = nib.Nifti1Image(fit_mask.astype(np.uint8), fit_img.affine)
         fit_img = truncate_image(fit_img, fit_mask_img, (VMIN_QUANTILE, VMAX_QUANTILE))
-        return {
+        output = {
             "image": torch.from_numpy(np.asarray(fit_img.dataobj, dtype=np.float32)),
             "mask": torch.from_numpy(fit_mask),
             # model input voxel -> image world mm
             "input_affine": fit_img.affine,
         }
+        if self.brain_mode != "none":
+            # brainmarks' brain mask, on the image grid, resampled nearest like the head mask
+            brain = np.asarray(resample_from_to(sample["brain_mask"], fit_img, order=0).dataobj) > 0
+            output["brain"] = torch.from_numpy(brain & fit_mask)
+        return output
 
     @torch.inference_mode()
     def forward_embeddings(
@@ -74,13 +90,22 @@ class Nanobrain(nn.Module):
         device = self.device
         images = torch.stack([sample["image"] for sample in samples]).to(device)
         masks = torch.stack([sample["mask"] for sample in samples]).to(device).float()
-        # live patches: any head-mask voxel, as in ViTMAE3D.dense_embed_native
+        if self.brain_mode != "none":
+            brains = torch.stack([sample["brain"] for sample in samples]).to(device).float()
+            assert (brains.flatten(1).sum(1) > 0).all(), "empty brain mask"
+        if self.brain_mode == "strip":
+            # skull-stripped input: zero outside the brain, and the model z-scores inside it
+            images, masks = images * brains, brains
+        # live patches: any mask voxel, as in ViTMAE3D.dense_embed_native
         kept = patchify3d(masks > 0, self.model.patch_size).any(dim=2).reshape(-1, *self.grid_size)
+        pooled = kept
+        if self.brain_mode == "pool":
+            pooled = patchify3d(brains > 0, self.model.patch_size).any(dim=2).reshape(-1, *self.grid_size)
 
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            if return_dense:
+            if return_dense or self.brain_mode == "pool":
                 dense = self.model.dense_embed_native(images, masks).float()  # (B, X, Y, Z, D)
-                global_embeds = [embeds[keep].mean(0) for embeds, keep in zip(dense, kept)]
+                global_embeds = [embeds[keep].mean(0) for embeds, keep in zip(dense, pooled)]
             else:
                 global_embeds = list(self.model.global_embed(images, masks).float())
 
@@ -101,6 +126,6 @@ class Nanobrain(nn.Module):
 
 
 @register_model
-def nanobrain(checkpoint: str) -> Nanobrain:
-    """A nanobrain pretraining checkpoint or readout model.pth."""
-    return Nanobrain(load_model(checkpoint))
+def nanobrain(checkpoint: str, brain_mode: str = "none") -> Nanobrain:
+    """A nanobrain pretraining checkpoint or readout model.pth. brain_mode (P20, see BRAIN_MODES)."""
+    return Nanobrain(load_model(checkpoint), brain_mode)
