@@ -14,7 +14,7 @@
 #SBATCH --error=/admin/home/dojo/nanobrain/slurms/%x_%j.err
 
 # SiamJEPA GPU smoke test (bf16 + torch.compile + EMA teacher, never run on GPU): one epoch each of
-# the planned 16 mm w768 arm without and with Random Shuffle Teacher. Reports vol/s (MAE p16-w768
+# the planned 16 mm arm (default width 384) without and with Random Shuffle Teacher. Reports vol/s (MAE p16
 # runs ~265-335, loader-bound), GPU util and memory, and the loss trend.
 # usage: sbatch experiments/dojo_1h/siamjepa/smoke.sbatch
 
@@ -29,7 +29,7 @@ DATA_ROOT="/data/nanobrain/FOMO300K_images"
 OUT_DIR="/data/dojo/nanobrain/output"
 SMOKE="${OUT_DIR}/siamjepa-smoke"
 mkdir -p "${SMOKE}"
-BASE="base_lr=0.003 optimizer=muon muon_impl=batched weight_decay=0.1 model_kwargs.embed_dim=768 model_kwargs.num_heads=12 patch_size=16 num_visible=168 num_predict=168 model_kwargs.objective=siamjepa"
+BASE="base_lr=0.003 optimizer=muon muon_impl=batched weight_decay=0.1 patch_size=16 num_visible=168 num_predict=168 model_kwargs.objective=siamjepa"
 
 for arm in plain rst; do
     extra=""
