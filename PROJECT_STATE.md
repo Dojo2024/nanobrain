@@ -128,6 +128,7 @@ FM = `base_lr=0.003 optimizer=muon muon_impl=batched norm_target=true`.
 - They run at ~265–335 volumes/s with the GPU only 44–60% busy, which gives ~19–20 epochs.
 - Extra width or decoder compute is therefore free in wall-clock time.
 - Several 16 mm jobs on one node slow each other. Check the epochs column before comparing.
+- More loader workers do not help (benchmark 2026-10-13: 15 workers = 8 workers). The wait is in storage reads or the single main process (pin memory, per-scan GPU preprocessing in a Python loop at `train.py:282`). Even with zero data wait the step would cap at ~450 vol/s.
 
 ## 6. Results
 
@@ -232,6 +233,7 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P14: sub-token decoder (16 mm token decoded as 8× 8 mm) | `ps16/w768-sub2` | small consistent positive |
 | P14: layout head (octant mean / log std) | `ps16/w768-layout` | mixed (FOMO lesion +.038, PMG −.011) |
 | L8: SIGReg β 0.1 / 1, InfoNCE | `ps16/sub2-sigreg-b0.1`, `-b1`, `-infonce` | not adopted |
+| Loader workers 8 / 12 / 15 at 16 mm (benchmark, job 530044) | `output/loader-bench/` | **negative**: 252 / 196 / 255 vol/s, data wait .035 / .048 / .030 s per ~.105 s step; worker count is not the limit (I/O or the main process is); 4-seed arm not run |
 | P20: brain-only readout, `pool` | `brainmarks-brainpool/` | small, not significant: CNP/OpenBHB up at both grids; rank 2.09 vs 2.32 (16 mm), 2.73 vs 2.86 (8 mm), same 2 seeds |
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
