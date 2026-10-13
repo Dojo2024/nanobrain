@@ -5,8 +5,8 @@
             added alone to the 5 reference models (our values rounded to 2 dp like the reference table)
 
 A cell with fewer seeds than the arm shows the count, e.g. .801(2). Missing cells are "-".
-`brainmarks-brainpool` only re-runs the 7 whole-scan tasks (the dense features are unchanged), so its
-segmentation cells are copied from the same seed's plain `brainmarks/` run and marked "p".
+Variants that only ran the 7 whole-scan tasks (`brainmarks-brainpool`, `brainmarks-cat9-12`) copy their
+segmentation cells from the same seeds' plain `brainmarks/` run, marked "p", so the rank stays over 11 tasks.
 
 usage: python experiments/dojo_1h/summarize.py /data/dojo/nanobrain/output > experiments/dojo_1h/all_results.md
 """
@@ -134,7 +134,7 @@ def main(out):
             cols, means, marks = [], [], []
             for t in BM_TASKS:
                 src = var
-                if var == "brainmarks-brainpool" and t in BM_SEG:
+                if t in BM_SEG and not any((r / var / f"{t}.json").exists() for r in have.values()):
                     src = "brainmarks"
                 v = [bm_score(r / src / f"{t}.json") for r in have.values()]
                 c = cell(v, len(have))

@@ -233,10 +233,11 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P14: sub-token decoder (16 mm token decoded as 8× 8 mm) | `ps16/w768-sub2` | small consistent positive |
 | P14: layout head (octant mean / log std) | `ps16/w768-layout` | mixed (FOMO lesion +.038, PMG −.011) |
 | L8: SIGReg β 0.1 / 1, InfoNCE | `ps16/sub2-sigreg-b0.1`, `-b1`, `-infonce` | not adopted |
-| Loader workers 8 / 12 / 15 at 16 mm (benchmark, job 530044) | `output/loader-bench/` | **negative**: 252 / 196 / 255 vol/s, data wait .035 / .048 / .030 s per ~.105 s step; worker count is not the limit (I/O or the main process is); 4-seed arm not run |
+| Loader workers 8 / 12 / 15 at 16 mm (benchmark, job 530044) | `experiments/dojo_1h/loader/` (outputs deleted) | **negative**: 252 / 196 / 255 vol/s, data wait .035 / .048 / .030 s per ~.105 s step; worker count is not the limit (I/O or the main process is); 4-seed arm not run |
 | P20: brain-only readout, `pool` | `brainmarks-brainpool/` | small, not significant: CNP/OpenBHB up at both grids; rank 2.09 vs 2.32 (16 mm), 2.73 vs 2.86 (8 mm), same 2 seeds |
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
+| Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **running** (jobs 530064–67) |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
@@ -271,6 +272,13 @@ On an IXI scan, cos(none, pool) = .926 and cos(none, strip) = .885. So the modes
   - the same two for `n23/w768-d8`
 - Width 1024: `paired.py ps16/w1024-sub2 ps16/w768-sub2` (FOMO and brainmarks), plus its rank vs the references.
 - Then add the results to section 7, and to the ledger `/admin/home/dojo/nanobrain-ideas.md` (end of the "Patch size 12 / 16 mm" section).
+
+**Running (submitted 2026-10-13 ~07:40): readout companion on `ps16/w1024-sub2`, 4 seeds, no training.**
+Jobs 530064–67 `nb-bmro-w1024-s{7338,1,2,3}` run `experiments/dojo_1h/readout/bm_global_readouts.sbatch <run dir>` on the 7 whole-scan tasks:
+- `brainmarks-brainpool/`: `brain_mode=pool` on checkpoint-last.
+- `brainmarks-cat9-12/`: the layers 9+12 readout (rebuilt with `nanobrain.readout --layers 9 12`, then deleted); the global embedding is mean-pooled layer 9 and layer 12 tokens, concatenated.
+
+Score with `paired.py ps16/w1024-sub2 ps16/w1024-sub2 --variant brainmarks-brainpool` (or `brainmarks-cat9-12`); `summarize.py` fills their segmentation cells from the plain run for the rank. Not run: pool combined with layers 9+12.
 
 ## 9. Offered, not yet approved by the user
 
