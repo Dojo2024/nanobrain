@@ -1,6 +1,6 @@
 # nanobrain 1 h ablations: project state
 
-Last updated 2026-10-13 ~05:30. Read this whole file before running anything. Every number for every
+Last updated 2026-10-13 ~07:15. Read this whole file before running anything. Every number for every
 run is in [experiments/dojo_1h/all_results.md](experiments/dojo_1h/all_results.md). Regenerate it with
 `summarize.py` (section 4) after new results land.
 
@@ -118,7 +118,8 @@ FM = `base_lr=0.003 optimizer=muon muon_impl=batched norm_target=true`.
 |---|---|---|---|
 | **Best on FOMO** (8 mm) | `n23/w768-d8` | `model_kwargs.embed_dim=768 model_kwargs.num_heads=12 model_kwargs.depth=8` (readout cat6-8) | 12 |
 | Best 8 mm on brainmarks (1 seed) | `n20/vis1024-w768` | `model_kwargs.embed_dim=768 model_kwargs.num_heads=12 num_visible=1024` | 11 |
-| **Best on brainmarks** (16 mm) | `ps16/w768-sub2` | `model_kwargs.embed_dim=768 model_kwargs.num_heads=12 patch_size=16 num_visible=168 num_predict=168 model_kwargs.decoder_sub=2 model_kwargs.decoder_sub_depth=1` | 20 |
+| **Best on brainmarks** (16 mm) | `ps16/w1024-sub2` | same as the next row but `model_kwargs.embed_dim=1024 model_kwargs.num_heads=16` | 18–21 |
+| Previous 16 mm best | `ps16/w768-sub2` | `model_kwargs.embed_dim=768 model_kwargs.num_heads=12 patch_size=16 num_visible=168 num_predict=168 model_kwargs.decoder_sub=2 model_kwargs.decoder_sub_depth=1` | 20 |
 | Simple 8 mm control | `n11/width512` | `model_kwargs.embed_dim=512 model_kwargs.num_heads=8` | 13 |
 
 **8 mm runs are GPU-bound.** Width 512 gets ~13 epochs and width 768 ~11–12.
@@ -144,7 +145,8 @@ FM = `base_lr=0.003 optimizer=muon muon_impl=batched norm_target=true`.
 | `ps16/baseline` (16 mm, Connor's recipe) | 4 | 20 | .668 | .865 | .795 | .549 | .002 | .003 | .819 | .627 |
 | `ps16/muon` (16 mm, Muon lr 3e-3) | 4 | 19 | .706 | .910 | .833 | .618 | .003 | .004 | .859 | .649 |
 | `ps/p16-w768` (16 mm, FM w768) | 4 | 20 | .681 | .923 | .860 | fails | .003 | .004 | .900 | .656 |
-| **`ps16/w768-sub2`** (16 mm, + P14) | 4 | 20 | .691 | .919 | .860 | fails | .003 | .005 | .912 | .657 |
+| `ps16/w768-sub2` (16 mm, + P14) | 4 | 20 | .691 | .919 | .860 | fails | .003 | .005 | .912 | .657 |
+| **`ps16/w1024-sub2`** (16 mm, width 1024) | 4 | 20 | .702 | .926 | .866 | fails | .004 | .004 | .922 | .658 |
 
 Best second readouts:
 - `n23/w768-d8` cat6-8: cortex .790, hippocampus .815, lesion .719.
@@ -169,7 +171,8 @@ Best second readouts:
 | `ps16/baseline` 16 mm | 4 | 3.64 | .608 | .672 | .915 | .715 | .689 | .746 | .656 | .797 | .490 | .498 | .444 |
 | `ps16/muon` 16 mm | 4 | 3.00 | .619 | .672 | .926 | .732 | .690 | .830 | .763 | .781 | .583 | .501 | .429 |
 | `ps/p16-w768` 16 mm | 4 | 2.45 | .625 | .685 | .928 | .733 | .688 | .876 | .819 | .795 | .613 | .527 | .429 |
-| **`ps16/w768-sub2`** 16 mm | 4 | **2.32** | .632 | .698 | .924 | .748 | .693 | .877 | .812 | .801 | .624 | .538 | .439 |
+| `ps16/w768-sub2` 16 mm | 4 | 2.32 | .632 | .698 | .924 | .748 | .693 | .877 | .812 | .801 | .624 | .538 | .439 |
+| **`ps16/w1024-sub2`** 16 mm | 4 | **2.14** | .636 | .705 | .926 | .738 | .693 | .886 | .823 | .807 | .638 | .548 | .451 |
 | `ps16/sub2-infonce` 16 mm | 2 | 2.27 | .637 | .706 | .920 | .744 | .698 | .879 | .832 | .795 | .623 | .528 | .431 |
 
 With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `summarize.py`. Some differ by ±0.05 from older ledger values because of ties after rounding to 2 dp.
@@ -226,14 +229,14 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | Plain patch 12/16 | `ps/p12`, `ps/p16`, `ps/p16-ns8` | negative on FOMO; brainmarks 2.68/2.77/3.05 |
 | 16 mm + width 768 | `ps/p16-w768` | brainmarks 2.45 |
 | 16 mm ladder | `ps16/baseline`, `ps16/muon` | the recipe transfers |
-| P14: sub-token decoder (16 mm token decoded as 8× 8 mm) | `ps16/w768-sub2` | small consistent positive, **best 16 mm** |
+| P14: sub-token decoder (16 mm token decoded as 8× 8 mm) | `ps16/w768-sub2` | small consistent positive |
 | P14: layout head (octant mean / log std) | `ps16/w768-layout` | mixed (FOMO lesion +.038, PMG −.011) |
 | L8: SIGReg β 0.1 / 1, InfoNCE | `ps16/sub2-sigreg-b0.1`, `-b1`, `-infonce` | not adopted |
 | P20: brain-only readout, `pool` | `brainmarks-brainpool/` | small, not significant: CNP/OpenBHB up at both grids; rank 2.09 vs 2.32 (16 mm), 2.73 vs 2.86 (8 mm), same 2 seeds |
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
-| Width 1024 at 16 mm | `ps16/w1024-sub2` | FOMO small positive vs w768-sub2 (lesion +.011, tumor/age +.007 4/4); brainmarks **running** |
+| Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
 
-## 8. Running now (submitted 2026-10-13, all started by ~05:00)
+## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
 | Jobs | Name | What | Output |
 |---|---|---|---|
@@ -255,7 +258,8 @@ On an IXI scan, cos(none, pool) = .926 and cos(none, strip) = .885. So the modes
 - `strip`, 8 mm: IXI −.035, OpenBHB −.018, lesion +.011. Rank 3.00.
 - Reading: our models were trained on whole heads, so skull-stripped inputs are out of distribution and age loses the head context. Brain-only pooling is cheap and leans positive but is inside the noise.
 
-**Width 1024 (FOMO, 4 seeds vs `ps16/w768-sub2`):** 18/20/21/21 epochs at 272–299 vol/s (same as width 768: loader-bound, so the width is free). Last layer: lesion +.011 (3/4), tumor +.007 (4/4), age +.007 (4/4), PMG +.010 (2/4), cortex +.001. cat9-12: lesion +.024 (3/4). Hippocampus fails to converge, as at width 768. Brainmarks still running.
+**Width 1024 (FOMO, 4 seeds vs `ps16/w768-sub2`):** 18/20/21/21 epochs at 272–299 vol/s (same as width 768: loader-bound, so the width is free). Last layer: lesion +.011 (3/4), tumor +.007 (4/4), age +.007 (4/4), PMG +.010 (2/4), cortex +.001. cat9-12: lesion +.024 (3/4). Hippocampus fails to converge, as at width 768. 
+**Width 1024 brainmarks (4 seeds vs `ps16/w768-sub2`, seeds better):** rank **2.14** vs 2.32. WT +.006 (4/4), TC +.013 (4/4), ET +.010 (3/4), lesion +.012 (3/4), IXI +.008 (3/4), OpenBHB +.012 (2/4), CNP +.007 (3/4), UPENN −.010 (1/4), rest ±.003. Small but consistent, and free because the run is loader-bound.
 
 **How to score when done.**
 - `summarize.py` gives the brainmarks rank of the `brainpool` and `brainstrip` rows. Pool rows copy the segmentation cells from the same seeds' plain run.
