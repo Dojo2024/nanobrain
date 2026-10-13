@@ -238,6 +238,7 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
 | Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **running** (jobs 530064–67) |
+| A2: spectral loss (SL-MAE, per patch) | `spectral_weight`, `experiments/dojo_1h/spectral/` | **ready, not yet run**: implemented by the user's coder, fixed 2026-10-13 (mask to head, log1p, float32 FFT); GPU smoke OK (175 vol/s, no slowdown); proposed arm 8 mm vs `n11/width512` |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
 
@@ -279,6 +280,12 @@ Jobs 530064–67 `nb-bmro-w1024-s{7338,1,2,3}` run `experiments/dojo_1h/readout/
 - `brainmarks-cat9-12/`: the layers 9+12 readout (rebuilt with `nanobrain.readout --layers 9 12`, then deleted); the global embedding is mean-pooled layer 9 and layer 12 tokens, concatenated.
 
 Score with `paired.py ps16/w1024-sub2 ps16/w1024-sub2 --variant brainmarks-brainpool` (or `brainmarks-cat9-12`); `summarize.py` fills their segmentation cells from the plain run for the rank. Not run: pool combined with layers 9+12.
+
+**A2 spectral loss smoke test (job 530070, 2026-10-13 07:53): runs.** One epoch of `n11/width512` + `spectral_weight=0.1` at 175 vol/s (control 172–180), bf16 + torch.compile fine (Inductor runs the complex FFT eagerly, no cost). `measure.py` on 8 real batches:
+- smoke checkpoint (1 epoch, w=0.1): masked MSE .887, spectral .634
+- `n11/width512` s7338 (1 h, trained without the term): MSE .412, spectral .940
+
+A fully trained MSE-only model still has a large spectral error, so the term asks for something MSE does not give. At a trained MSE of ~.4, weight 0.1 makes it ~15–23% of the loss and 0.5 about equal to the MSE.
 
 ## 9. Offered, not yet approved by the user
 
