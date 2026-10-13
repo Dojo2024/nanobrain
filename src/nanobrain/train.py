@@ -299,6 +299,7 @@ def train_one_epoch(
                 global_weight=args.global_weight,
                 sigreg_lambda=args.sigreg_lambda,
                 infonce_tau=args.infonce_tau,
+                spectral_weight=args.spectral_weight,
             )
 
         loss_for_log = loss.detach()
@@ -366,6 +367,7 @@ def train_one_epoch(
                 global_weight=args.global_weight,
                 sigreg_lambda=args.sigreg_lambda,
                 infonce_tau=args.infonce_tau,
+                spectral_weight=args.spectral_weight,
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)
@@ -441,6 +443,7 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
                 global_weight=args.global_weight,
                 sigreg_lambda=args.sigreg_lambda,
                 infonce_tau=args.infonce_tau,
+                spectral_weight=args.spectral_weight,
             )
         loss.backward()
     model.zero_grad(set_to_none=True)

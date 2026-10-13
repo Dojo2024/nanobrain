@@ -48,6 +48,10 @@ layout_weight: 0.1
 global_weight: 0.1
 sigreg_lambda: 0.05
 infonce_tau: 0.07
+# A2: Fourier spectral loss (SL-MAE, Ergün et al., arXiv 2606.13315), per predicted patch: high-pass
+# weighted squared difference of log1p Fourier magnitudes, in-mask voxels only (model.spectral_loss).
+# 0 disables. Our notes' D1 arm uses 0.1; the smoke test measures the term's size after training.
+spectral_weight: 0.0
 
 # Model (ViT-S encoder).
 model_kwargs:

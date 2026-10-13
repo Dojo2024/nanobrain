@@ -199,6 +199,31 @@ class ViTMAE3D(nn.Module):
                 nn.GELU(),
                 nn.Linear(global_hidden_dim, global_proj_dim),
             )
+
+        # A2: Fourier spectral loss (SL-MAE, Ergün et al., arXiv 2606.13315), see spectral_loss.
+        # High-pass radial mask for per-patch 3D rfft. Shape (Px, Py, Pz//2+1).
+        # Weight = 1 - exp(-r² / (2 * σ²)) with r in cycles per patch and σ = 1: DC gets 0, r = 1
+        # gets .39, r = 2 gets .86, r >= 3 about 1. At patch 16 the same σ is a lower cutoff in mm.
+        freq_shape = (patch_size, patch_size, patch_size // 2 + 1)
+        freq_coords = torch.stack(
+            torch.meshgrid(
+                *[torch.arange(s) for s in freq_shape],
+                indexing="ij",
+            ),
+            dim=-1,
+        ).float()
+        # Wrap frequencies: indices > half map to negative frequencies.
+        for ii, s in enumerate(freq_shape[:2]):  # first two dims are full FFT
+            freq_coords[..., ii] = torch.where(
+                freq_coords[..., ii] > s // 2,
+                freq_coords[..., ii] - s,
+                freq_coords[..., ii],
+            )
+        # Last dim (rfft) is always non-negative, no wrapping.
+        freq_radius = freq_coords.norm(dim=-1)
+        highpass_mask = 1.0 - torch.exp(-0.5 * freq_radius ** 2)
+        self.register_buffer("spectral_mask", highpass_mask, persistent=False)
+
         self.init_weights()
 
     @classmethod
@@ -297,6 +322,7 @@ class ViTMAE3D(nn.Module):
         global_weight: float = 0.1,
         sigreg_lambda: float = 0.05,
         infonce_tau: float = 0.07,
+        spectral_weight: float = 0.0,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -350,6 +376,13 @@ class ViTMAE3D(nn.Module):
             pred_patches, pred_layout = pred_patches.split([pred_patches.shape[-1] - 16, 16], dim=-1)
         loss = F.mse_loss(pred_patches, target_patches, reduction="none")
         loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
+        # A2: per-patch spectral loss, patches weighted by their in-mask voxel count
+        if spectral_weight > 0:
+            spec_loss = spectral_loss(
+                pred_patches, target_patches, target_mask_patches, self.spectral_mask, self.patch_size
+            )
+            patch_voxels = target_mask_patches.sum(dim=-1).to(spec_loss.dtype)
+            loss = loss + spectral_weight * (spec_loss * patch_voxels).sum() / patch_voxels.sum()
         if self.layout_head:
             layout_loss = layout_valid * (pred_layout - layout_target) ** 2
             loss = loss + layout_weight * layout_loss.sum() / layout_valid.sum().clamp_min(1)
@@ -466,6 +499,31 @@ def to_eval_grid(
     x, weight = x[:, :D], x[:, D:]
     x = torch.where(weight > 0, x / weight.clamp_min(1e-6), 0.0)
     return x.permute(0, 2, 3, 4, 1)
+
+
+def spectral_loss(
+    pred: Float[Tensor, "B M V"],
+    target: Float[Tensor, "B M V"],
+    mask: Float[Tensor, "B M V"],
+    highpass: Float[Tensor, "P P Q"],
+    patch_size: int,
+) -> Float[Tensor, "B M"]:
+    """A2 per patch (SL-MAE, arXiv 2606.13315): high-pass weighted squared difference of the log
+    Fourier magnitudes of the predicted and target patch, mean over frequency bins.
+
+    Voxels outside the mask are zeroed in both, as in the paper's full-volume version where the
+    background is 0. Without this, boundary patches dominate: norm_target turns the background into
+    a large constant (e.g. -34) and the masked MSE leaves the predictions there untrained.
+    log1p (eps = 1) instead of log(|F| + 1e-6): RMS |F| is ~23 for a unit-variance 8^3 patch, and
+    a tiny eps lets noise-level bins and the all-zero initial prediction dominate the loss and its
+    gradient (~228 per patch at step 0). FFTs in float32: torch.fft rejects bfloat16."""
+    p = patch_size
+    shape = (*pred.shape[:-1], p, p, p)
+    mask = mask.reshape(shape).float()
+    spec_pred = torch.fft.rfftn(pred.float().reshape(shape) * mask, dim=(-3, -2, -1))
+    spec_target = torch.fft.rfftn(target.float().reshape(shape) * mask, dim=(-3, -2, -1))
+    diff = (torch.log1p(spec_pred.abs()) - torch.log1p(spec_target.abs())).square()
+    return (diff * highpass).sum(dim=(-3, -2, -1)) / highpass.numel()
 
 
 def sigreg(
