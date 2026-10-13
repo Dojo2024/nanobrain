@@ -237,7 +237,7 @@ With our model added, Neuro-JEPA ranks ~2.45–2.73. Ranks are recomputed by `su
 | P20: brain-only readout, `pool` | `brainmarks-brainpool/` | small, not significant: CNP/OpenBHB up at both grids; rank 2.09 vs 2.32 (16 mm), 2.73 vs 2.86 (8 mm), same 2 seeds |
 | P20: brain-only readout, `strip` | `brainmarks-brainstrip/` | negative: age −.04 (16 mm, 2/2 significant), classification slightly down, lesion +.012; rank 2.73 vs 2.32 |
 | Width 1024 at 16 mm | `ps16/w1024-sub2` | **positive, best 16 mm**: brainmarks rank 2.14 vs 2.32 (WT/TC 4/4), FOMO lesion +.011, tumor/age +.007 (4/4); free in wall-clock |
-| Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **running** (jobs 530064–67) |
+| Whole-scan readouts on width 1024: brain pool, layers 9+12 | `brainmarks-brainpool/`, `brainmarks-cat9-12/` | **null**, keep the plain readout: rank 2.18 / 2.23 vs 2.14; pool CNP +.011 (4/4, the one effect seen in all 3 P20 tests); layers 9+12 CNP/IDH/UPENN +.005–.006 (4/4) but ABIDE −.016 (0/4) |
 | A2: spectral loss (SL-MAE, per patch) | `spectral_weight`, `experiments/dojo_1h/spectral/` | **ready, not yet run**: implemented by the user's coder, fixed 2026-10-13 (mask to head, log1p, float32 FFT); GPU smoke OK (175 vol/s, no slowdown); proposed arm 8 mm vs `n11/width512` |
 
 ## 8. Latest round (submitted 2026-10-13, all COMPLETED by ~07:10; nothing running)
@@ -274,7 +274,9 @@ On an IXI scan, cos(none, pool) = .926 and cos(none, strip) = .885. So the modes
 - Width 1024: `paired.py ps16/w1024-sub2 ps16/w768-sub2` (FOMO and brainmarks), plus its rank vs the references.
 - Then add the results to section 7, and to the ledger `/admin/home/dojo/nanobrain-ideas.md` (end of the "Patch size 12 / 16 mm" section).
 
-**Running (submitted 2026-10-13 ~07:40): readout companion on `ps16/w1024-sub2`, 4 seeds, no training.**
+**Readout companion on `ps16/w1024-sub2`, 4 seeds, no training (jobs 530064–67, COMPLETED 08:15): NULL.** Pool vs plain: CNP +.011 (4/4), OpenBHB +.005, IXI −.009 (0/4), rest ±.002; rank 2.18. Layers 9+12 vs plain: CNP +.006, IDH +.005, UPENN +.006 (all 4/4), IXI +.002, ABIDE −.016 (0/4), mRS −.005, OpenBHB −.004; rank 2.23 (plain 2.14). Readout changes move whole-scan tasks by ~±.01, far below the gap to the references (IDH .94, mRS .77, age .92/.88); that gap is in training, not the readout.
+
+Setup:
 Jobs 530064–67 `nb-bmro-w1024-s{7338,1,2,3}` run `experiments/dojo_1h/readout/bm_global_readouts.sbatch <run dir>` on the 7 whole-scan tasks:
 - `brainmarks-brainpool/`: `brain_mode=pool` on checkpoint-last.
 - `brainmarks-cat9-12/`: the layers 9+12 readout (rebuilt with `nanobrain.readout --layers 9 12`, then deleted); the global embedding is mean-pooled layer 9 and layer 12 tokens, concatenated.
