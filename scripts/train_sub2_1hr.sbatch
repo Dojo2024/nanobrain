@@ -31,13 +31,3 @@ fi
 uv run --no-sync python -m nanobrain.eval.run \
     "${RUN_DIR}/checkpoint-last.pth" \
     "${RUN_DIR}/eval"
-
-# Optional: Multi-layer readout (cat9-12) evaluation
-uv run --no-sync python -m nanobrain.readout \
-    "${RUN_DIR}/checkpoint-last.pth" \
-    "${RUN_DIR}/readout/cat9-12/model.pth" \
-    --layers 9 12 --global-layers 9 12 --combine cat
-
-uv run --no-sync python -m nanobrain.eval.run \
-    "${RUN_DIR}/readout/cat9-12/model.pth" \
-    "${RUN_DIR}/readout/cat9-12"
