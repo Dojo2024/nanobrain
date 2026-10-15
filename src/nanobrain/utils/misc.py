@@ -8,6 +8,7 @@
 
 import datetime
 import logging
+import math
 import os
 import random
 import subprocess
@@ -432,8 +433,14 @@ def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
     return total_norm
 
 
+# Hidden weight matrices that Muon updates: attention and mlp weights in the encoder, decoder,
+# and sub-token decoder blocks, and the encoder to decoder projection. The patch embedding,
+# position embeddings, tokens and decoder head stay on AdamW, as in Moonshot's recipe.
+MUON_PREFIXES = ("blocks.", "decoder_blocks.", "decoder_proj.", "decoder_sub_blocks.")
+
+
 # from dinov2 with some minor changes
-def get_param_groups(model, patch_embed_lr_mult=1.0):
+def get_param_groups(model, patch_embed_lr_mult=1.0, muon=False, muon_lr_mult=1.0):
     # no lr decay, we could add this later if needed
     all_params = []
 
@@ -447,6 +454,11 @@ def get_param_groups(model, patch_embed_lr_mult=1.0):
 
         if "patch_embed" in name:
             d["lr_multiplier"] = d["lr_multiplier"] * patch_embed_lr_mult
+
+        if muon:
+            d["muon"] = param.ndim == 2 and name.startswith(MUON_PREFIXES)
+            if d["muon"]:
+                d["lr_multiplier"] = d["lr_multiplier"] * muon_lr_mult
 
         all_params.append(d)
 
@@ -465,6 +477,126 @@ def _fuse_param_groups(all_param_groups):
 
     param_groups = list(fused_param_groups.values())
     return param_groups
+
+
+def zeropower_via_newtonschulz_batched(
+    grads: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
+) -> Tensor:
+    """torch.optim._muon._zeropower_via_newtonschulz on a [K, A, B] stack of matrices at once."""
+    a, b, c = ns_coefficients
+    ortho = grads.bfloat16()
+    transpose = grads.size(-2) > grads.size(-1)
+    if transpose:
+        ortho = ortho.mT
+    ortho = ortho / ortho.norm(dim=(-2, -1), keepdim=True).clamp(min=eps)
+    for _ in range(ns_steps):
+        gram = ortho @ ortho.mT
+        gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        ortho = torch.baddbmm(ortho, gram_update, ortho, beta=a)
+    if transpose:
+        ortho = ortho.mT
+    return ortho
+
+
+class BatchedMuon(Optimizer):
+    """torch.optim.Muon with adjust_lr_fn match_rms_adamw, but matrices of the same shape are
+    orthogonalized together in one batched Newton-Schulz instead of one at a time in a Python
+    loop. Same update and defaults; state is a per-param momentum_buffer, as in torch."""
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        weight_decay: float = 0.1,
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315),
+        eps: float = 1e-7,
+        ns_steps: int = 5,
+    ):
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_coefficients=ns_coefficients,
+            eps=eps,
+            ns_steps=ns_steps,
+        )
+        super().__init__(params, defaults)
+        for group in self.param_groups:
+            for param in group["params"]:
+                assert param.ndim == 2, "BatchedMuon only takes 2D params"
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            buckets = defaultdict(list)
+            for param in group["params"]:
+                if param.grad is not None:
+                    buckets[tuple(param.shape)].append(param)
+            for (rows, cols), params in buckets.items():
+                grads = torch.stack([param.grad for param in params])
+                bufs = []
+                for param in params:
+                    state = self.state[param]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(param.grad)
+                    bufs.append(state["momentum_buffer"])
+                buf = torch.stack(bufs)
+                buf.lerp_(grads, 1 - group["momentum"])
+                torch._foreach_copy_(bufs, list(buf.unbind(0)))
+                update = grads.lerp(buf, group["momentum"]) if group["nesterov"] else buf
+                update = zeropower_via_newtonschulz_batched(
+                    update, group["ns_coefficients"], group["ns_steps"], group["eps"]
+                )
+                # match_rms_adamw, as torch.optim._muon._adjust_lr
+                adjusted_lr = group["lr"] * 0.2 * math.sqrt(max(rows, cols))
+                torch._foreach_mul_(params, 1 - group["lr"] * group["weight_decay"])
+                update = update.to(params[0].dtype)
+                torch._foreach_add_(params, list(update.unbind(0)), alpha=-adjusted_lr)
+
+
+class MuonAdamW:
+    """Muon for the param groups flagged muon, AdamW for the rest, stepped as one optimizer.
+
+    Muon's update is rescaled to AdamW's rms (adjust_lr_fn match_rms_adamw, Moonshot, 2502.16982),
+    so both share the lr and weight decay schedule. param_groups lists both optimizers' groups, so
+    update_lr, update_wd and clip_grad cover every parameter. No GradScaler support. impl torch is
+    torch.optim.Muon, batched is BatchedMuon (same update, faster).
+    """
+
+    def __init__(self, param_groups, betas=None, fused=None, impl="torch"):
+        muon_groups = [g for g in param_groups if g["muon"]]
+        if impl == "torch":
+            self.muon = torch.optim.Muon(muon_groups, adjust_lr_fn="match_rms_adamw")
+        else:
+            assert impl == "batched", impl
+            self.muon = BatchedMuon(muon_groups)
+        adamw_kwargs = {}
+        if betas is not None:
+            adamw_kwargs["betas"] = betas
+        if fused is not None:
+            adamw_kwargs["fused"] = fused
+        self.adamw = torch.optim.AdamW(
+            [g for g in param_groups if not g["muon"]], **adamw_kwargs
+        )
+        self.param_groups = self.muon.param_groups + self.adamw.param_groups
+
+    def step(self):
+        self.muon.step()
+        self.adamw.step()
+
+    def zero_grad(self, set_to_none: bool = True):
+        self.muon.zero_grad(set_to_none)
+        self.adamw.zero_grad(set_to_none)
+
+    def state_dict(self):
+        return {"muon": self.muon.state_dict(), "adamw": self.adamw.state_dict()}
+
+    def load_state_dict(self, state_dict):
+        self.muon.load_state_dict(state_dict["muon"])
+        self.adamw.load_state_dict(state_dict["adamw"])
 
 
 def update_lr(param_groups, lr: float):
