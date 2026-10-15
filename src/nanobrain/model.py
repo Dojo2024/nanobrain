@@ -24,6 +24,8 @@ class ViTMAE3D(nn.Module):
         mlp_ratio: int | float = 4,
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
+        decoder_sub: int = 1,
+        decoder_sub_depth: int = 1,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -80,7 +82,36 @@ class ViTMAE3D(nn.Module):
         )
 
         self.decoder_norm = LayerNorm(decoder_embed_dim)
-        self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+
+        # decoder_sub (pixel-unshuffle sub-token decoder): each predicted coarse patch
+        # is split into decoder_sub^3 sub-cubes, each decoded as its own token on the finer grid.
+        assert patch_size % decoder_sub == 0, (patch_size, decoder_sub)
+        self.decoder_sub = decoder_sub
+        head_dim = patch_dim
+        if decoder_sub > 1:
+            self.decoder_unshuffle = nn.Linear(decoder_embed_dim, decoder_sub**3 * decoder_embed_dim)
+            sub_grid_size = tuple(size * decoder_sub for size in patch_grid_size)
+            self.decoder_sub_pos_embed = SeparablePosEmbed3D(sub_grid_size, decoder_embed_dim)
+            self.decoder_sub_blocks = nn.ModuleList(
+                [
+                    Block(
+                        dim=decoder_embed_dim,
+                        num_heads=decoder_num_heads,
+                        qkv_bias=qkv_bias,
+                        proj_bias=proj_bias,
+                        mlp_ratio=mlp_ratio,
+                    )
+                    for _ in range(decoder_sub_depth)
+                ]
+            )
+            self.decoder_sub_norm = LayerNorm(decoder_embed_dim)
+            offsets = torch.stack(
+                torch.meshgrid(*[torch.arange(decoder_sub)] * 3, indexing="ij"), dim=-1
+            ).reshape(-1, 3)
+            self.register_buffer("sub_offsets", offsets, persistent=False)
+            head_dim = (patch_size // decoder_sub) ** 3
+
+        self.decoder_head = nn.Linear(decoder_embed_dim, head_dim)
         self.init_weights()
 
     @classmethod
@@ -142,6 +173,15 @@ class ViTMAE3D(nn.Module):
 
         x = x[:, -M:]
         x = self.decoder_norm(x)
+        if self.decoder_sub > 1:
+            s = self.decoder_sub
+            x = self.decoder_unshuffle(x).reshape(B, M * s**3, -1)
+            sub_coord = target_coord[:, :, None, :] * s + self.sub_offsets
+            x = self.decoder_sub_pos_embed(x, sub_coord.reshape(B, M * s**3, 3))
+            for block in self.decoder_sub_blocks:
+                x = block(x)
+            x = self.decoder_head(self.decoder_sub_norm(x))
+            return merge_subcubes(x.reshape(B, M, s**3, -1), self.patch_size, s)
         x = self.decoder_head(x)
         return x
 
@@ -153,6 +193,7 @@ class ViTMAE3D(nn.Module):
         num_predict: int | None = None,
         num_samples: int = 1,
         with_state: bool = True,
+        norm_target: bool = False,
     ):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
@@ -176,6 +217,14 @@ class ViTMAE3D(nn.Module):
             mask_patches, [num_visible, num_predict], dim=1
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
+
+        if norm_target:
+            mask_val = target_mask_patches.to(target_patches.dtype)
+            count = mask_val.sum(dim=-1, keepdim=True)
+            mean = (mask_val * target_patches).sum(dim=-1, keepdim=True) / count.clamp_min(1)
+            var = (mask_val * (target_patches - mean) ** 2).sum(dim=-1, keepdim=True) / count.clamp_min(1)
+            std = torch.sqrt(var + 1e-6)
+            target_patches = torch.where(mask_val > 0, (target_patches - mean) / std, 0.0)
 
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)
@@ -203,6 +252,16 @@ class ViTMAE3D(nn.Module):
         return loss, state
 
     def dense_embed(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B Ex Ey Ez D"]:
+        """Patch embeddings on the eval's 8 mm grid, which the frozen eval asserts. Other patch
+        sizes are interpolated onto it (to_eval_grid); 8 mm is dense_embed_native unchanged."""
+        embeds = self.dense_embed_native(images, mask)
+        return to_eval_grid(embeds, patchify3d(mask > 0, self.patch_size).any(dim=2), self.patch_size)
+
+    def dense_embed_native(
         self,
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
@@ -234,10 +293,65 @@ class ViTMAE3D(nn.Module):
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B D"]:
-        embeds = self.dense_embed(images, mask).flatten(1, 3)
+        embeds = self.dense_embed_native(images, mask).flatten(1, 3)
         in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
         embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
         return embeds
+
+
+# the frozen eval probes an 8 mm patch grid (eval/probe.py PATCH_GRID_SHAPE, 24x30x24)
+EVAL_PATCH_SIZE = 8
+
+
+def to_eval_grid(
+    embeds: Float[Tensor, "B Gx Gy Gz D"],
+    in_mask: torch.Tensor,
+    patch_size: int,
+) -> Float[Tensor, "B Ex Ey Ez D"]:
+    """Trilinear interpolation of a patch_size grid onto the 8 mm eval grid, normalized by the
+    interpolated in-mask weight so empty patches (zeros) do not dim the edge of the head.
+    align_corners=False maps patch centres onto patch centres for any patch size."""
+    if patch_size == EVAL_PATCH_SIZE:
+        return embeds
+    B, *grid, D = embeds.shape
+    eval_grid = [size * patch_size // EVAL_PATCH_SIZE for size in grid]
+    weight = in_mask.reshape(B, 1, *grid).to(embeds.dtype)
+    x = torch.cat([embeds.permute(0, 4, 1, 2, 3) * weight, weight], dim=1)
+    x = F.interpolate(x, size=eval_grid, mode="trilinear", align_corners=False)
+    x, weight = x[:, :D], x[:, D:]
+    x = torch.where(weight > 0, x / weight.clamp_min(1e-6), 0.0)
+    return x.permute(0, 2, 3, 4, 1)
+
+
+def split_subcubes(x: Float[Tensor, "B M P"], patch_size: int, sub: int) -> Float[Tensor, "B M S Q"]:
+    """Voxels of each patch (patchify3d order) regrouped into its sub^3 sub-cubes, in
+    meshgrid(ij) order of the sub-cube offsets, each in patchify3d order."""
+    q = patch_size // sub
+    return rearrange(
+        x,
+        "b m (ox qx oy qy oz qz) -> b m (ox oy oz) (qx qy qz)",
+        ox=sub,
+        oy=sub,
+        oz=sub,
+        qx=q,
+        qy=q,
+        qz=q,
+    )
+
+
+def merge_subcubes(x: Float[Tensor, "B M S Q"], patch_size: int, sub: int) -> Float[Tensor, "B M P"]:
+    """Inverse of split_subcubes."""
+    q = patch_size // sub
+    return rearrange(
+        x,
+        "b m (ox oy oz) (qx qy qz) -> b m (ox qx oy qy oz qz)",
+        ox=sub,
+        oy=sub,
+        oz=sub,
+        qx=q,
+        qy=q,
+        qz=q,
+    )
 
 
 def patchify3d(x: Tensor, patch_size: int = 8) -> Tensor:

@@ -1,0 +1,69 @@
+# Config for 16mm patch size with pixel-unshuffle sub-token decoder (sub2),
+# ViT-Large (w1024), BatchedMuon optimizer, and normalized targets (norm_target).
+# This configuration achieved Rank 2.14 across Brainmarks 11-task benchmark.
+
+name: ps16_w1024_sub2
+notes: "16mm ViT-L with sub2 pixel-unshuffle decoder and BatchedMuon (Brainmarks Rank 2.14)"
+output_dir: output
+
+data_root: data/FOMO300K_images
+train_filelist: data/FOMO300K_images/filelist_subsampled.txt
+num_workers: 8
+prefetch_factor: 2
+
+grid_size: [192, 240, 192]
+patch_size: 16
+
+num_visible: 168
+num_predict: 168
+num_samples: 2
+
+norm_target: true
+
+model_kwargs:
+  depth: 12
+  embed_dim: 1024
+  num_heads: 16
+  decoder_depth: 4
+  decoder_embed_dim: 512
+  decoder_num_heads: 8
+  class_tokens: 1
+  drop_path_rate: 0.0
+  decoder_sub: 2
+  decoder_sub_depth: 1
+
+epochs: 40
+batch_size: 32
+accum_iter: 1
+
+base_lr: 0.003
+lr: null
+min_lr: 1e-6
+warmup_epochs: 5
+weight_decay: 0.05
+optimizer: muon
+muon_lr_mult: 1.0
+muon_impl: batched
+betas: [0.9, 0.95]
+clip_grad: 1.0
+fused_adamw: true
+
+amp: true
+amp_dtype: bfloat16
+compile: true
+
+ckpt: null
+resume: false
+auto_resume: true
+start_epoch: 0
+checkpoint_period: 10
+max_checkpoints: 5
+print_freq: 100
+plot_period: 5
+plot_nrow: 4
+plot_ncol: 2
+plot_num_predict: null
+device: cuda
+seed: 1
+debug: false
+wandb: false

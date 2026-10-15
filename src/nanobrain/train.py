@@ -106,12 +106,25 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    param_groups = misc.get_param_groups(model)
+    opt_name = args.get("optimizer", "adamw")
+    muon_lr_mult = args.get("muon_lr_mult", 1.0)
+    muon_impl = args.get("muon_impl", "batched")
+    assert opt_name == "muon" or muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
+    param_groups = misc.get_param_groups(
+        model, muon=opt_name == "muon", muon_lr_mult=muon_lr_mult
+    )
     misc.update_lr(param_groups, args.lr)
     misc.update_wd(param_groups, args.weight_decay)
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    if opt_name == "adamw":
+        optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    else:
+        assert opt_name == "muon", opt_name
+        optimizer = misc.MuonAdamW(param_groups, betas=betas, fused=args.fused_adamw, impl=muon_impl)
+        num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
+        num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
+        logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M ({muon_impl})")
 
     epoch_num_batches = len(train_loader)
     steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
@@ -131,6 +144,7 @@ def main(args: DictConfig):
         loss_scaler = torch.GradScaler(device.type)
     else:
         loss_scaler = None
+    assert loss_scaler is None or opt_name == "adamw", "muon has no GradScaler support"
 
     # load checkpoint/resume training
     misc.load_model(args, model, optimizer, loss_scaler)
@@ -231,6 +245,7 @@ def train_one_epoch(
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
+                norm_target=getattr(args, "norm_target", False),
             )
 
         loss_for_log = loss.detach()
@@ -283,6 +298,7 @@ def train_one_epoch(
                 num_visible=args.num_visible,
                 num_predict=args.plot_num_predict,
                 num_samples=1,
+                norm_target=getattr(args, "norm_target", False),
             )
         model.train()
         plot_paths = make_plots(args, example_images, example_masks, state, epoch)

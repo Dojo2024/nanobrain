@@ -24,6 +24,9 @@ num_visible: 1280
 num_predict: 1280
 num_samples: 2
 
+# Target standardization
+norm_target: false
+
 # Model (ViT-S encoder).
 model_kwargs:
   depth: 12
@@ -34,6 +37,8 @@ model_kwargs:
   decoder_num_heads: 8
   class_tokens: 1
   drop_path_rate: 0.0
+  decoder_sub: 1
+  decoder_sub_depth: 1
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
 epochs: 40
@@ -45,6 +50,9 @@ lr: null
 min_lr: 1e-6
 warmup_epochs: 5
 weight_decay: 0.05
+optimizer: adamw
+muon_lr_mult: 1.0
+muon_impl: batched
 betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true
