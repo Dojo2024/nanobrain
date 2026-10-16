@@ -71,20 +71,20 @@ for task in ${TASKS}; do
     fi
 done
 
-# second score: layers 9 and 12 concatenated (N1, nanobrain-ideas.md section 0.10), ~12 min.
-# READOUT_LAYERS overrides the pair for other depths, e.g. READOUT_LAYERS="6 8" at depth 8.
-# Each task runs on its own so a failed probe fit costs that task only.
-READOUT_LAYERS="${READOUT_LAYERS:-9 12}"
-READOUT_NAME="cat${READOUT_LAYERS// /-}"
-READOUT_DIR="${RUN_DIR}/readout/${READOUT_NAME}"
-.venv/bin/python -m nanobrain.readout \
-    "${RUN_DIR}/checkpoint-last.pth" "${READOUT_DIR}/model.pth" --layers ${READOUT_LAYERS}
-for task in $(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASKS; print(*DEFAULT_TASKS)'); do
-    if ! .venv/bin/python -m nanobrain.eval.run "${READOUT_DIR}/model.pth" "${READOUT_DIR}" --tasks "${task}"; then
-        echo "FAILED ${READOUT_NAME} ${task}" | tee -a "${RUN_DIR}/readout/failed.txt"
-    fi
-done
-rm "${READOUT_DIR}/model.pth"
+# second score: layers 9 and 12 concatenated (disabled: user requested evaluating only the last layer)
+# To re-enable in future if needed, set READOUT_LAYERS explicitly (e.g. READOUT_LAYERS="9 12")
+if [[ -n "${READOUT_LAYERS:-}" ]]; then
+    READOUT_NAME="cat${READOUT_LAYERS// /-}"
+    READOUT_DIR="${RUN_DIR}/readout/${READOUT_NAME}"
+    .venv/bin/python -m nanobrain.readout \
+        "${RUN_DIR}/checkpoint-last.pth" "${READOUT_DIR}/model.pth" --layers ${READOUT_LAYERS}
+    for task in $(.venv/bin/python -c 'from nanobrain.eval.tasks import DEFAULT_TASKS; print(*DEFAULT_TASKS)'); do
+        if ! .venv/bin/python -m nanobrain.eval.run "${READOUT_DIR}/model.pth" "${READOUT_DIR}" --tasks "${task}"; then
+            echo "FAILED ${READOUT_NAME} ${task}" | tee -a "${RUN_DIR}/readout/failed.txt"
+        fi
+    done
+    rm "${READOUT_DIR}/model.pth"
+fi
 
 # EMA checkpoints (ema_decays), last layer only, ~6 min each, into eval-ema<decay>
 for ckpt in "${RUN_DIR}"/checkpoint-ema*.pth; do

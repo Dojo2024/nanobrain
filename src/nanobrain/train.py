@@ -295,8 +295,41 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
+    def prefetch_batch_generator(loader):
+        stream = torch.cuda.Stream(device) if use_cuda else None
+
+        def _prep(raw_batch):
+            if use_cuda:
+                with torch.cuda.stream(stream):
+                    raw_batch = misc.send_data(raw_batch, device)
+                    collated = default_collate(
+                        [process_sample(s, intensity_aug=args.intensity_aug) for s in raw_batch]
+                    )
+                    return collated
+            else:
+                return default_collate(
+                    [process_sample(s, intensity_aug=args.intensity_aug) for s in raw_batch]
+                )
+
+        it = iter(loader)
+        first = next(it, None)
+        if first is None:
+            return
+        curr = _prep(first)
+        for nxt in it:
+            if stream is not None:
+                torch.cuda.current_stream(device).wait_stream(stream)
+            curr_batch = curr
+            curr = _prep(nxt)
+            yield curr_batch
+        if stream is not None:
+            torch.cuda.current_stream(device).wait_stream(stream)
+        yield curr
+
+    prefetched_loader = prefetch_batch_generator(data_loader)
+
     for batch_idx, batch in enumerate(
-        metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
+        metric_logger.log_every(prefetched_loader, print_freq, header, total_steps=num_batches)
     ):
         batch_step = batch_idx + 1
         log_step = batch_step % print_freq == 0 or batch_step == num_batches
@@ -314,11 +347,6 @@ def train_one_epoch(
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
-        if use_cuda:
-            batch = misc.send_data(batch, device)
-
-        # run volume processing on gpu, not cpu workers
-        batch = default_collate([process_sample(s, intensity_aug=args.intensity_aug) for s in batch])
         images = batch["image"]
         masks = batch["mask"]
 
