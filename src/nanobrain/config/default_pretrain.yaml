@@ -91,6 +91,12 @@ model_kwargs:
   # with decoder_sub_depth blocks over them (e.g. 2 at patch_size 16 predicts at 8 mm); 1 is off
   decoder_sub: 1
   decoder_sub_depth: 1
+  # P2: octant dense readout — at eval time, use the decoder_sub pipeline (unshuffle + pos embed
+  # + sub blocks) on each encoder token to emit decoder_sub^3 distinct vectors per patch, giving
+  # native 8 mm resolution from a 16 mm encoder. octant_sub_depth controls the number of sub blocks;
+  # 0 means just unshuffle + pos embed (cheapest). Requires decoder_sub > 1.
+  octant_head: false
+  octant_sub_depth: 1
   # L8: a loss on each sequence's mean visible token through a projector the eval never uses
   # (see global_weight): none, sigreg (LeJEPA invariance + SIGReg) or infonce (COJEPA)
   global_loss: none

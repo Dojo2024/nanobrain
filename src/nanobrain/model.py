@@ -44,6 +44,8 @@ class ViTMAE3D(nn.Module):
         mhc: int = 0,
         decoder_sub: int = 1,
         decoder_sub_depth: int = 1,
+        octant_head: bool = False,
+        octant_sub_depth: int = 1,
         layout_head: bool = False,
         global_loss: str = "none",
         global_hidden_dim: int = 2048,
@@ -174,11 +176,19 @@ class ViTMAE3D(nn.Module):
             self.register_buffer("sub_offsets", offsets, persistent=False)
             head_dim = (patch_size // decoder_sub) ** 3
 
+        # P2: octant_head — eval-only dense readout that uses the decoder_sub pipeline to emit
+        # sub^3 distinct vectors per encoder token, giving native 8 mm resolution from a coarse
+        # encoder. Shares decoder_sub's pos embed and blocks (trained during MAE training).
+        self.octant_head = octant_head
+        if octant_head:
+            assert decoder_sub > 1, "octant_head needs decoder_sub > 1"
+
         # stats_head: 2 extra outputs per patch, its in-mask intensity mean and log std
         # layout_head (P14 (i)): 16 extra outputs per patch, the raw in-mask mean and log std of each
         # of its 8 octant sub-cubes, i.e. where intensity sits inside the patch
         assert not (stats_head and layout_head), "one auxiliary head"
-        assert decoder_sub == 1 or not (stats_head or layout_head), "aux heads need decoder_sub 1"
+        assert decoder_sub == 1 or not (stats_head or layout_head), "stats/layout heads need decoder_sub 1"
+        assert not octant_head or decoder_sub > 1, "octant_head needs decoder_sub > 1"
         self.stats_head = stats_head
         self.layout_head = layout_head
         num_aux = 2 if stats_head else 16 if layout_head else 0
@@ -578,7 +588,10 @@ class ViTMAE3D(nn.Module):
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B Ex Ey Ez D"]:
         """Patch embeddings on the eval's 8 mm grid, which the frozen eval asserts. Other patch
-        sizes are interpolated onto it (to_eval_grid); 8 mm is dense_embed_native unchanged."""
+        sizes are interpolated onto it (to_eval_grid); 8 mm is dense_embed_native unchanged.
+        When octant_head is enabled, uses decoder_sub pipeline for native 8 mm resolution."""
+        if self.octant_head:
+            return self.dense_embed_native_octants(images, mask)
         embeds = self.dense_embed_native(images, mask)
         return to_eval_grid(embeds, patchify3d(mask > 0, self.patch_size).any(dim=2), self.patch_size)
 
@@ -609,14 +622,72 @@ class ViTMAE3D(nn.Module):
         embeds = embeds.reshape(B, *patch_grid_size, self.embed_dim)
         return embeds
 
+    def dense_embed_native_octants(
+        self,
+        images: Float[Tensor, "B X Y Z"],
+        mask: Float[Tensor, "B X Y Z"],
+    ) -> Float[Tensor, "B Fx Fy Fz D"]:
+        """P2: dense embeddings at the fine grid (patch_size / decoder_sub), using the decoder_sub
+        pipeline to emit decoder_sub^3 distinct vectors per coarse patch.
+
+        Each encoder token is unshuffled into sub^3 sub-tokens, positional embeddings are applied
+        at the fine grid, sub blocks refine them, and the result is reshaped to the fine grid.
+        Shares decoder_sub's pos embed and blocks (trained during MAE)."""
+        assert self.octant_head and self.decoder_sub > 1
+        s = self.decoder_sub
+        B = images.shape[0]
+        assert tuple(images.shape[1:]) == tuple(self.grid_size)
+        coarse_grid = [size // self.patch_size for size in self.grid_size]
+        fine_grid = [size * s for size in coarse_grid]
+        fine_total = fine_grid[0] * fine_grid[1] * fine_grid[2]
+        dd = self.decoder_proj.out_features  # decoder_embed_dim
+        embeds_fine = images.new_zeros(B, *fine_grid, dd)
+
+        # Encoder + decoder_sub pipeline, one forward per image
+        for ii in range(B):
+            image_mask = mask[ii] > 0
+            values = images[ii][image_mask]
+            values = values / values.max()
+            values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
+            image = torch.zeros_like(images[ii])
+            image[image_mask] = values
+            patches = patchify3d(image[None], self.patch_size)
+            in_mask = patchify3d(image_mask[None], self.patch_size).any(dim=2)[0]
+            x = self.forward_encoder(patches[:, in_mask], self.coord_grid[:, in_mask])
+            h = x[0, self.class_tokens:]  # [M, D]
+
+            # decoder_sub pipeline: unshuffle → pos embed → sub blocks → norm
+            h = self.decoder_proj(h)  # [M, Dd]
+            M = h.shape[0]
+            sub_tokens = self.decoder_unshuffle(h).reshape(M, s**3, -1)  # [M, s³, Dd]
+            coarse_coord = self.coord_grid[0, in_mask]  # [M, 3]
+            sub_coord = coarse_coord[:, None, :] * s + self.sub_offsets[None, :, :]  # [M, s³, 3]
+            sub_tokens = self.decoder_sub_pos_embed(sub_tokens, sub_coord)
+            for block in self.decoder_sub_blocks:
+                sub_tokens = block(sub_tokens)
+            sub_tokens = self.decoder_sub_norm(sub_tokens).to(embeds_fine.dtype)  # [M, s³, Dd]
+
+            # Vectorized scatter: flat indices into fine grid
+            flat_idx = (sub_coord[:, :, 0] * fine_grid[1] * fine_grid[2] +
+                        sub_coord[:, :, 1] * fine_grid[2] +
+                        sub_coord[:, :, 2]).long().flatten()  # [M*s³]
+            embeds_fine[ii].flatten(0, 2)[flat_idx] = sub_tokens.flatten(0, 1)
+
+        return embeds_fine
+
     def global_embed(
         self,
         images: Float[Tensor, "B X Y Z"],
         mask: Float[Tensor, "B X Y Z"],
     ) -> Float[Tensor, "B D"]:
-        embeds = self.dense_embed_native(images, mask).flatten(1, 3)
-        in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
-        embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
+        if self.octant_head:
+            # Use dense_embed (routes to octant method) for finer-grained pooling
+            embeds = self.dense_embed(images, mask).flatten(1, 3)
+            embeds = embeds.mean(dim=1)
+        else:
+            embeds = self.dense_embed_native(images, mask).flatten(1, 3)
+            in_mask = patchify3d(mask > 0, self.patch_size).any(dim=2)
+            embeds = (embeds * in_mask[..., None]).sum(dim=1) / in_mask.sum(dim=1, keepdim=True)
         return embeds
 
 
