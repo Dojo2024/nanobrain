@@ -224,8 +224,6 @@ def main(args: DictConfig):
 
 def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
     assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
-    impl = "fused" if args.get("muon_fused") else args.get("muon_impl", "torch")
-    assert args.optimizer == "muon" or impl == "torch", "muon_impl / muon_fused needs optimizer muon"
     param_groups = misc.get_param_groups(
         model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
     )
@@ -237,6 +235,7 @@ def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
         optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
     else:
         assert args.optimizer == "muon", args.optimizer
+        impl = "fused" if args.get("muon_fused") else args.get("muon_impl", "torch")
         optimizer = misc.MuonAdamW(
             param_groups, betas=betas, fused=args.fused_adamw, impl=impl
         )
