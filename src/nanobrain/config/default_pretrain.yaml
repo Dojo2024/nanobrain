@@ -152,8 +152,9 @@ optimizer: adamw
 # Scales the lr of the Muon params only (optimizer muon); AdamW params keep lr.
 muon_lr_mult: 1.0
 # torch: torch.optim.Muon, one matrix at a time. batched: misc.BatchedMuon, the same update with
-# same-shape matrices orthogonalized together, so fewer kernel launches per step.
-muon_impl: torch
+# same-shape matrices orthogonalized together. fused: compiled BatchedMuon with fused momentum/cast/NS polynomial.
+muon_impl: fused
+muon_fused: true
 betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true
@@ -161,6 +162,10 @@ fused_adamw: true
 amp: true
 amp_dtype: bfloat16
 compile: true
+# Run training step on high priority cuda stream so background data prep fills idle SMs
+prioritize_compute: true
+# Run batched GPU decoding/scattering across the entire batch (431 launches vs 1228)
+data_prep_per_image: false
 
 # EMA copies of the weights for evaluation, a list of decays, or null. Each is updated after every
 # optimizer step and saved each epoch as checkpoint-ema<decay>.pth, a model-only checkpoint the

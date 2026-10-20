@@ -498,7 +498,29 @@ def backward_step(
 
 def clip_grad(optimizer: Optimizer, max_norm: float | None = None) -> Tensor:
     params = [p for group in optimizer.param_groups for p in group["params"]]
-    if max_norm:
+    # optimizers that defer the clip (fused muon) take the clip coefficient as grad_scale and
+    # apply it inside their step, saving a pass over their grads. same math as clip_grad_norm_
+    deferred = []
+    if getattr(optimizer, "defers_grad_clip", False):
+        deferred.append(optimizer)
+    if hasattr(optimizer, "muon") and getattr(optimizer.muon, "defers_grad_clip", False):
+        deferred.append(optimizer.muon)
+    if hasattr(optimizer, "optimizers"):
+        for opt in optimizer.optimizers:
+            if getattr(opt, "defers_grad_clip", False):
+                deferred.append(opt)
+
+    if max_norm and deferred:
+        skip = {p for opt in deferred for group in opt.param_groups for p in group["params"]}
+        grads = [p.grad for p in params if p.grad is not None]
+        total_norm = nn.utils.get_total_norm(grads, error_if_nonfinite=False)
+        clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
+        rest = [p.grad for p in params if p.grad is not None and p not in skip]
+        if rest:
+            torch._foreach_mul_(rest, clip_coef)
+        for opt in deferred:
+            opt.grad_scale = clip_coef
+    elif max_norm:
         total_norm = nn.utils.clip_grad_norm_(params, max_norm, error_if_nonfinite=False)
     else:
         grads = [p.grad for p in params if p.grad is not None]
@@ -559,6 +581,48 @@ def _fuse_param_groups(all_param_groups):
     return param_groups
 
 
+def _newtonschulz5_poly(X: Tensor, steps: int) -> Tensor:
+    # zeropower_via_newtonschulz5 on a stack of bf16 rows <= cols matrices. the same iteration
+    # X = a X + (b A + c A^2) X evaluated as X = P X, P = a I + b A + c A^2: one fused pointwise
+    # kernel on the small square matrix between plain gemms. rounds fewer intermediates to bf16,
+    # so it lands closer to an fp64 reference than the unfused bf16 version
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    eye = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
+    for _ in range(steps):
+        A = X @ X.mT
+        P = a * eye + b * A + c * (A @ A)
+        X = P @ X
+    return X
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _fused_muon_update(
+    params: list[Tensor],
+    grads: list[Tensor],
+    bufs: list[Tensor],
+    decay: Tensor,
+    alpha: Tensor,
+    grad_scale: Tensor | None,
+    momentum: float,
+    nesterov: bool,
+    ns_steps: int,
+):
+    updates = []
+    for g, buf in zip(grads, bufs):
+        if grad_scale is not None:
+            g = g * grad_scale
+        buf.lerp_(g, 1 - momentum)
+        u = g.lerp(buf, momentum) if nesterov else buf
+        u = u.bfloat16()
+        updates.append(u.mT if u.size(0) > u.size(1) else u)
+    X = _newtonschulz5_poly(torch.stack(updates), ns_steps)
+    for p, u in zip(params, X.unbind(0)):
+        if p.size(0) > p.size(1):
+            u = u.mT
+        p.mul_(decay).add_(u.to(p.dtype) * alpha)
+
+
 def zeropower_via_newtonschulz_batched(
     grads: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
 ) -> Tensor:
@@ -593,6 +657,7 @@ class BatchedMuon(Optimizer):
         ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315),
         eps: float = 1e-7,
         ns_steps: int = 5,
+        fused: bool = False,
     ):
         defaults = dict(
             lr=lr,
@@ -604,12 +669,56 @@ class BatchedMuon(Optimizer):
             ns_steps=ns_steps,
         )
         super().__init__(params, defaults)
+        self.fused = fused
+        self.defers_grad_clip = fused
+        self.grad_scale: Tensor | None = None
         for group in self.param_groups:
             for param in group["params"]:
                 assert param.ndim == 2, "BatchedMuon only takes 2D params"
 
+    def _coefs(self, shape, device) -> tuple[Tensor, Tensor]:
+        cache = self.__dict__.setdefault("_coef_cache", {})
+        if shape not in cache:
+            cache[shape] = (torch.zeros((), device=device), torch.zeros((), device=device))
+        return cache[shape]
+
+    def _fused_step(self):
+        grad_scale = self.grad_scale
+        self.grad_scale = None
+        for group in self.param_groups:
+            by_shape = defaultdict(list)
+            for p in group["params"]:
+                if p.grad is not None:
+                    by_shape[tuple(sorted(p.shape))].append(p)
+
+            lr, wd = group["lr"], group["weight_decay"]
+            for shape, params in by_shape.items():
+                bufs = []
+                for p in params:
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(p.grad)
+                    bufs.append(state["momentum_buffer"])
+                coefs = self._coefs(shape, params[0].device)
+                coefs[0].fill_(1 - lr * wd)
+                coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
+                _fused_muon_update(
+                    params,
+                    [p.grad for p in params],
+                    bufs,
+                    coefs[0],
+                    coefs[1],
+                    grad_scale,
+                    momentum=group["momentum"],
+                    nesterov=group["nesterov"],
+                    ns_steps=group["ns_steps"],
+                )
+
     @torch.no_grad()
     def step(self):
+        if self.fused:
+            self._fused_step()
+            return
         for group in self.param_groups:
             buckets = defaultdict(list)
             for param in group["params"]:
@@ -643,16 +752,19 @@ class MuonAdamW:
     Muon's update is rescaled to AdamW's rms (adjust_lr_fn match_rms_adamw, Moonshot, 2502.16982),
     so both share the lr and weight decay schedule. param_groups lists both optimizers' groups, so
     update_lr, update_wd and clip_grad cover every parameter. No GradScaler support. impl torch is
-    torch.optim.Muon, batched is BatchedMuon (same update, faster).
+    torch.optim.Muon, batched is BatchedMuon, fused is compiled BatchedMuon.
     """
 
     def __init__(self, param_groups, betas=None, fused=None, impl="torch"):
         muon_groups = [g for g in param_groups if g["muon"]]
         if impl == "torch":
             self.muon = torch.optim.Muon(muon_groups, adjust_lr_fn="match_rms_adamw")
+        elif impl == "batched":
+            self.muon = BatchedMuon(muon_groups, fused=False)
+        elif impl == "fused":
+            self.muon = BatchedMuon(muon_groups, fused=True)
         else:
-            assert impl == "batched", impl
-            self.muon = BatchedMuon(muon_groups)
+            raise ValueError(f"unknown muon impl: {impl}")
         self.adamw = torch.optim.AdamW(
             [g for g in param_groups if not g["muon"]], betas=betas, fused=fused
         )
@@ -706,16 +818,41 @@ def send_data(x, device=None):
     return x
 
 
-def pre_send_to_cuda_wrapper(generator, device=None):
-    """From apex"""
+_DEVICE_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    # one side stream per device for the whole run. the caching allocator keeps freed memory
+    # per stream, so a new stream every epoch strands the previous epoch's cached blocks
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    if idx not in _DEVICE_SIDE_STREAMS:
+        _DEVICE_SIDE_STREAMS[idx] = torch.cuda.Stream(device)
+    return _DEVICE_SIDE_STREAMS[idx]
+
+
+def pre_send_to_cuda_wrapper(generator, device=None, process_fn=None):
+    """From apex: async copy and processing on persistent side stream."""
+    dev = torch.device("cuda" if device is None else device)
+    if dev.type != "cuda":
+        for next_data in generator:
+            if process_fn is not None:
+                next_data = process_fn(next_data)
+            yield next_data
+        return
+
     data = None
-    stream = torch.cuda.Stream(device)
+    stream = _side_stream(dev)
     for next_data in generator:
         with torch.cuda.stream(stream):
-            next_data = send_data(next_data, device=device)
+            next_data = send_data(next_data, device=dev)
+            if process_fn is not None:
+                next_data = process_fn(next_data)
         if data is not None:
             yield data
-        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.cuda.current_stream(dev).wait_stream(stream)
+        for x in torch.utils._pytree.tree_leaves(next_data):
+            if isinstance(x, Tensor):
+                x.record_stream(torch.cuda.current_stream(dev))
         data = next_data
     if data is not None:
         yield data

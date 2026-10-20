@@ -340,7 +340,8 @@ class ViTMAE3D(nn.Module):
         B = images.shape[0]
         V, P = num_visible, num_predict
         patches = patchify3d(images, self.patch_size)
-        mask_patches = patchify3d(mask, self.patch_size)
+        # masks can come as uint8 (process_batch), the cast fuses into the compiled graph
+        mask_patches = patchify3d(mask.to(images.dtype), self.patch_size)
         coord = self.coord_grid.expand(B, -1, -1)
         order = sample_sequences(mask_patches, 1, 2 * V + P)[:, 0]
         batch_ids = torch.arange(B, device=images.device)[:, None]
@@ -481,7 +482,8 @@ class ViTMAE3D(nn.Module):
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
         patches = patchify3d(images, self.patch_size)
-        mask_patches = patchify3d(mask, self.patch_size)
+        # masks can come as uint8 (process_batch), the cast fuses into the compiled graph
+        mask_patches = patchify3d(mask.to(images.dtype), self.patch_size)
         coord = self.coord_grid.expand(B, -1, -1)
 
         # sample num_samples sequences per image, then flatten them into the batch

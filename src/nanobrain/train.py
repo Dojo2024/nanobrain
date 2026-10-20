@@ -20,7 +20,12 @@ from torch.utils.data import DataLoader, Sampler, default_collate
 from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.utils.misc as misc
-from nanobrain.data import BrainNpzDataset, process_sample
+from nanobrain.data import (
+    BrainNpzDataset,
+    process_batch,
+    process_batch_per_image,
+    process_sample,
+)
 from nanobrain.model import ViTMAE3D, fine_patch_state_dict, make_mask_groups, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
@@ -157,6 +162,13 @@ def main(args: DictConfig):
         assert sub * args.switch_patch_size == args.patch_size, "the switch needs decoder_sub"
         assert not args.ema_decays and not args.start_epoch, "a switch run has no ema, can't resume"
 
+    if args.get("prioritize_compute") and device.type == "cuda":
+        # run the training step on a high priority stream, so the data prep kernels on the side
+        # stream (misc.pre_send_to_cuda_wrapper) mostly take the sms the step leaves idle
+        stream = torch.cuda.Stream(device, priority=-1)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        torch.cuda.set_stream(stream)
+
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
     # with a time budget, epochs run until the budget runs out
@@ -212,7 +224,8 @@ def main(args: DictConfig):
 
 def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
     assert args.optimizer == "muon" or args.muon_lr_mult == 1.0, "muon_lr_mult needs optimizer muon"
-    assert args.optimizer == "muon" or args.muon_impl == "torch", "muon_impl needs optimizer muon"
+    impl = "fused" if args.get("muon_fused") else args.get("muon_impl", "torch")
+    assert args.optimizer == "muon" or impl == "torch", "muon_impl / muon_fused needs optimizer muon"
     param_groups = misc.get_param_groups(
         model, muon=args.optimizer == "muon", muon_lr_mult=args.muon_lr_mult
     )
@@ -225,11 +238,13 @@ def make_optimizer(args: DictConfig, model: nn.Module) -> torch.optim.Optimizer:
     else:
         assert args.optimizer == "muon", args.optimizer
         optimizer = misc.MuonAdamW(
-            param_groups, betas=betas, fused=args.fused_adamw, impl=args.muon_impl
+            param_groups, betas=betas, fused=args.fused_adamw, impl=impl
         )
         num_muon = sum(p.numel() for g in optimizer.muon.param_groups for p in g["params"])
         num_adamw = sum(p.numel() for g in optimizer.adamw.param_groups for p in g["params"])
-        logger.info(f"optimizer: muon {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M")
+        logger.info(
+            f"optimizer: muon ({impl}) {num_muon / 1e6:.2f}M params, adamw {num_adamw / 1e6:.2f}M"
+        )
     return optimizer
 
 
@@ -295,38 +310,18 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
-    def prefetch_batch_generator(loader):
-        stream = torch.cuda.Stream(device) if use_cuda else None
+    # run volume processing on gpu, not cpu workers. copy and process the next batch on a
+    # side stream while the current step computes
+    if args.get("intensity_aug"):
+        process_fn = lambda raw_batch: default_collate(
+            [process_sample(s, intensity_aug=True) for s in raw_batch]
+        )
+    elif args.get("data_prep_per_image"):
+        process_fn = process_batch_per_image
+    else:
+        process_fn = process_batch
 
-        def _prep(raw_batch):
-            if use_cuda:
-                with torch.cuda.stream(stream):
-                    raw_batch = misc.send_data(raw_batch, device)
-                    collated = default_collate(
-                        [process_sample(s, intensity_aug=args.intensity_aug) for s in raw_batch]
-                    )
-                    return collated
-            else:
-                return default_collate(
-                    [process_sample(s, intensity_aug=args.intensity_aug) for s in raw_batch]
-                )
-
-        it = iter(loader)
-        first = next(it, None)
-        if first is None:
-            return
-        curr = _prep(first)
-        for nxt in it:
-            if stream is not None:
-                torch.cuda.current_stream(device).wait_stream(stream)
-            curr_batch = curr
-            curr = _prep(nxt)
-            yield curr_batch
-        if stream is not None:
-            torch.cuda.current_stream(device).wait_stream(stream)
-        yield curr
-
-    prefetched_loader = prefetch_batch_generator(data_loader)
+    prefetched_loader = misc.pre_send_to_cuda_wrapper(data_loader, device=device, process_fn=process_fn)
 
     for batch_idx, batch in enumerate(
         metric_logger.log_every(prefetched_loader, print_freq, header, total_steps=num_batches)
