@@ -304,13 +304,18 @@ A fully trained MSE-only model still has a large spectral error, so the term ask
 - P7 `p7/w512-switch30` (530275–78): FM w512 at `patch_size=16 num_visible=168 num_predict=168 model_kwargs.decoder_sub=2 model_kwargs.decoder_sub_depth=1 switch_min=30`; it continues at 8 mm (1280/1280, plain decoder) from the first epoch boundary after 30 min. `log.txt` says `switched to patch 8` at the switch. The final checkpoint is an 8 mm model. Compare on FOMO with `n11/width512` (and `n23/w768-d8`), on brainmarks with the 5 references (and `n11/width512`, `ps/p16`).
 - Code: `train.switch_patch_size`, `train.make_optimizer`, `model.fine_patch_state_dict`; CPU checks `experiments/dojo_1h/patchsize/check_switch.py`.
 
-**Performance Optimization (2026-10-20, branch `perf-opt`, commit `01a7c4b`):**
+**Performance Optimization (2026-10-20, branch `perf-opt`, commit `b06c585`):**
 Ported Mihir's 1-hour throughput optimization stack into `nanobrain`:
-1. **Batched GPU Data Prep** (`data.process_batch`): single-pass concatenated run-length decoding and scattering into pre-allocated batch tensors (`brle_scatter`). Reduces CUDA kernel launches from 1,228 to 431 per batch.
+1. **Batched GPU Data Prep** (`data.process_batch`): single-pass concatenated run-length decoding and scattering into pre-allocated batch tensors (`brle_scatter`). Reduces CUDA kernel launches from 1,228 to 431 per batch. Data prep wait time dropped from 0.070s to 0.011s (~5.5x faster).
 2. **Compiled Fused Muon** (`BatchedMuon(fused=True)` / `muon_impl: fused`): `@torch.compile(fullgraph=True)` kernel with polynomial Newton-Schulz evaluation ($P = aI + bA + cA^2, X = PX$) and deferred gradient clipping (`defers_grad_clip=True`), avoiding multiple passes over gradients.
 3. **Prioritized CUDA Compute Stream** (`prioritize_compute: true`): runs forward/backward training step on `Stream(priority=-1)` so background asynchronous data preparation on persistent `_side_stream` fills idle SMs without stalling compute.
 4. **`uint8` Mask Handling**: casts masks directly inside `ViTMAE3D` forward graph (`mask.to(images.dtype)`).
-Verified with unit tests on `login-2`. Pushed to `dojo/perf-opt`. Ready for 5-minute speed probe before 1-hour training.
+5. **Verified with 5-minute speed probe (`538999` on `n-3`)**: step time dropped from 0.195s to 0.138s, steady-state throughput jumped to 225 vol/s, 295 TFLOP/s, completing an entire 1456-step epoch in 4m32s.
+
+**Running (submitted 2026-10-20 ~17:00): `ps16/w1024-sub2-opt`, 4 jobs, `BRAINMARKS=1`, 96G, 2:30:**
+- Arm: `ps16/w1024-sub2-opt` (seeds 7338, 1, 2, 3; Slurm job IDs 539009, 539010, 539011, 539012).
+- Recipe: `patch_size=16 num_visible=168 num_predict=168 norm_target=true model_kwargs.embed_dim=1024 model_kwargs.num_heads=16 model_kwargs.decoder_sub=2 base_lr=0.003 optimizer=muon muon_impl=fused muon_fused=true prioritize_compute=true data_prep_per_image=false`.
+- Target: Evaluate whether the throughput stack pushes training past 20 epochs (projected 24–25 epochs in 1 hour) and improves downstream Brainmarks rank (control `ps16/w1024-sub2` was ~18–19 epochs, rank 2.14).
 
 ## 9. Offered, not yet approved by the user
 
