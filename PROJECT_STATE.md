@@ -312,10 +312,10 @@ Ported Mihir's 1-hour throughput optimization stack into `nanobrain`:
 4. **`uint8` Mask Handling**: casts masks directly inside `ViTMAE3D` forward graph (`mask.to(images.dtype)`).
 5. **Verified with 5-minute speed probe (`538999` on `n-3`)**: step time dropped from 0.195s to 0.138s, steady-state throughput jumped to 225 vol/s, 295 TFLOP/s, completing an entire 1456-step epoch in 4m32s.
 
-**Running (submitted 2026-10-20 ~17:00): `ps16/w1024-sub2-opt`, 4 jobs, `BRAINMARKS=1`, 96G, 2:30:**
-- Arm: `ps16/w1024-sub2-opt` (seeds 7338, 1, 2, 3; Slurm job IDs 539009, 539010, 539011, 539012).
+**Running (submitted 2026-10-20 ~17:00, seed 7338 resubmitted 17:55): `ps16/w1024-sub2-opt`, 4 jobs, `BRAINMARKS=1`, 96G, 2:30:**
+- Arm: `ps16/w1024-sub2-opt` (seeds 7338 [job 539161, resubmitted after preemption of 539009], 1 [539010], 2 [539011], 3 [539012]).
 - Recipe: `patch_size=16 num_visible=168 num_predict=168 norm_target=true model_kwargs.embed_dim=1024 model_kwargs.num_heads=16 model_kwargs.decoder_sub=2 base_lr=0.003 optimizer=muon muon_impl=fused muon_fused=true prioritize_compute=true data_prep_per_image=false`.
-- Target: Evaluate whether the throughput stack pushes training past 20 epochs (projected 24–25 epochs in 1 hour) and improves downstream Brainmarks rank (control `ps16/w1024-sub2` was ~18–19 epochs, rank 2.14).
+- Intermediate telemetry: seeds 2 and 3 running at ~0.114 s/it (2m47s / epoch on n-8), reaching Epoch 17+ at 53 minutes. Target: 20+ completed epochs in 1 hour.
 
 ## 9. Offered, not yet approved by the user
 
