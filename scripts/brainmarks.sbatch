@@ -29,7 +29,8 @@ shift 3
 
 cd /admin/home/dojo/nanobrain
 export VIRTUAL_ENV=
-export DATA_ROOT=/data/connor/brain_datasets/datasets
+export DATA_ROOT=/data/brainmarks-smri
+export BRAINMARKS_SMRI_DATA=/data/brainmarks-smri
 export PYTHONPATH=/admin/home/dojo/brainmarks-smri/src:/admin/home/dojo/nanobrain/experiments/brainmarks
 # 8 loader workers x 2 threads = the 16 cpus
 export OMP_NUM_THREADS=2

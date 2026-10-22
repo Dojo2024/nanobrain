@@ -329,6 +329,27 @@ Ported Mihir's 1-hour throughput optimization stack into `nanobrain`:
 - Recipe: `patch_size=16 num_visible=168 num_predict=168 norm_target=true model_kwargs.embed_dim=1024 model_kwargs.num_heads=16 model_kwargs.decoder_sub=2 base_lr=0.003 optimizer=muon muon_impl=fused muon_fused=true prioritize_compute=true data_prep_per_image=false`.
 - Intermediate telemetry: seeds 2 and 3 running at ~0.114 s/it (2m47s / epoch on n-8), reaching Epoch 17+ at 53 minutes. Target: 20+ completed epochs in 1 hour.
 
+**SoViT Depth Scaling & 16 mm Scaling Results (2026-10-22, 4 seeds each, COMPLETED):**
+- **`ps8/w384-d20` (Slim & Ultra-Deep: $D=384, L=20$, jobs 542370–73):**
+  - **NEW BEST 8 mm BRAINMARKS RANK IN PROJECT HISTORY:** **2.59 (11 tasks)** (beating prior `w384-d16` 2.64, `w768-d8` 2.73, and `w384-opt` 2.77).
+  - Brainmarks tasks: ABIDE **.639** (beating all 5 references: Neuro-JEPA .63, BrainDINO .61, DINOv3 .61); BraTS Whole Tumor **.834**, Tumor Core **.672**, Enhancing Tumor **.661** (smashing reference models .75/.59/.43); SOOP Lesion **.514** (beats references .35/.38/.32).
+  - FOMO: Lesion .714 (last layer) / .716 (`cat16-20`); Tumor .893 / .898; Age .869 / .875; Hippo .790 / .796; PMG .961; Cortex .738 / .758.
+  - Throughput: Completed 12 epochs in 1 hour.
+- **`ps16/w768-d16-sub2-opt` (Deep 16 mm: $D=768, L=16$, jobs 542374–77):**
+  - **NEW ALL-TIME BEST BRAINMARKS RANK IN PROJECT HISTORY (ANY PATCH SIZE):** **2.41 (11 tasks)** (beating prior best `ps16/w768d8-sub2-opt` 2.50).
+  - Brainmarks tasks: Whole Tumor **.797** (beats all 5 references: .75/.69/.75/.73/.74); Enhancing Tumor **.532** (beats all 5 references: .43/.44/.45/.43/.32); Tumor Core **.621**; ABIDE **.635**; CNP **.688**; SOOP Lesion **.443**; UPENN **.735**.
+  - FOMO: DWI Tumor **.921** (last layer) / **.923** (`cat12-16`) — all-time high on DWI tumor; ADC Lesion **.702** / **.715**; PMG .911.
+  - Throughput: Completed 18 full epochs in 1 hour.
+
+**Brainmarks-smri Upstream Upgrade & Extended Eval Suite (2026-10-22):**
+- Updated `~/brainmarks-smri` to commit `647c340`.
+- Integrated zip shard loader (`shards/*.zip`), eliminating NFS / filesystem bottlenecks during parallel evaluation.
+- Benchmark expanded to 19 tasks: added `atlas_lesion`, `oasis1_dementia`, `oasis2_dementia`, `oasis2_conversion`, `fomo26_task5_pmg`, `fomo26_task4_nerve`, `fomo26_task4_vessel`, and fixed `adhd_diagnosis`.
+- Updated `scripts/brainmarks.sbatch` with `BRAINMARKS_SMRI_DATA=/data/brainmarks-smri`.
+- **Running (submitted 2026-10-22 ~18:30): 8 jobs evaluating the extended suite on champion models:**
+  - `ps8/w384-d20` across 4 seeds (`542619`–`542622`).
+  - `ps16/w768-d16-sub2-opt` across 4 seeds (`542623`–`542626`).
+
 ## 9. Offered, not yet approved by the user
 
 - P13: an octant readout head.
