@@ -25,11 +25,11 @@ num_visible: 640
 num_predict: 1920
 num_samples: 2
 
-# Model (ViT-S encoder).
+# Model (ViT-B encoder).
 model_kwargs:
   depth: 12
-  embed_dim: 384
-  num_heads: 6
+  embed_dim: 768
+  num_heads: 12
   decoder_depth: 4
   decoder_embed_dim: 512
   decoder_num_heads: 8
@@ -37,15 +37,17 @@ model_kwargs:
   drop_path_rate: 0.0
 
 # Optimization. batch_size is images per step; each gives num_samples sequences.
-epochs: 40
 batch_size: 32
 accum_iter: 1
 
-base_lr: 0.001
+base_lr: 5e-4
 lr: null
 min_lr: 1e-6
-warmup_epochs: 5
-decay_epochs: 0
+# Steps are optimizer updates. ViT-B runs ~0.16 s/step on one H100, so ~45K steps in 2 hr.
+# Runs stopped early by SIGTERM (e.g. `timeout`) save and exit cleanly.
+total_steps: 45000
+warmup_steps: 13500
+decay_steps: 0
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
@@ -55,19 +57,17 @@ amp: true
 amp_dtype: bfloat16
 compile: true
 
-# Checkpointing.
+# Checkpointing. checkpoint-last.pth is overwritten every checkpoint_period steps and at the end.
+# checkpoint_steps lists steps to also keep as numbered checkpoints.
 ckpt: null
 resume: false
 auto_resume: true
-start_epoch: 0
-checkpoint_period: 5
-checkpoint_epochs: null
-# null keeps all checkpoints.
-max_checkpoints: null
+checkpoint_period: 2500
+checkpoint_steps: null
 
 # Logging.
 print_freq: 100
-plot_period: 5
+plot_period: 5000
 plot_nrow: 4
 plot_ncol: 2
 # Number of patches to predict for plotting. null predicts all unseen mask patches.

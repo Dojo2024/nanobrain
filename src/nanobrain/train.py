@@ -2,10 +2,10 @@ import argparse
 import datetime
 import json
 import logging
-import math
 import os
+import signal
+import threading
 import time
-from functools import partial
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -20,7 +20,15 @@ from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
 import nanobrain.misc as misc
-from nanobrain.data import Fomo300kDataset, default_transform
+from nanobrain.data import (
+    Fomo300kDataset,
+    InfiniteSampler,
+    brle_to_dense,
+    fit_to_shape,
+    normalize_values,
+    reorient_to_ras,
+    resample_to_spacing,
+)
 from nanobrain.model import ViTMAE3D, patches_to_volume
 from nanobrain.visualization import plot_mask_pred
 
@@ -31,6 +39,7 @@ DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 
 def main(args: DictConfig):
     # setup
+    process_start_time = time.monotonic()
     assert int(os.environ.get("WORLD_SIZE", 1)) == 1, "distributed training not supported"
     device = torch.device(args.device)
     misc.random_seed(args.seed)
@@ -63,23 +72,10 @@ def main(args: DictConfig):
     logger.info(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"cwd: {Path.cwd()}")
     logger.info(f"sha: {misc.git_sha()}")
+    if device.type == "cuda":
+        logger.info(f"gpu: {torch.cuda.get_device_name(device)}")
+    logger.info(f"torch: {torch.__version__} (cuda {torch.version.cuda})")
     logger.info(f"config:\n{OmegaConf.to_yaml(args)}")
-
-    # data loader
-    dataset = Fomo300kDataset(args.data_root, args.train_filelist)
-    batch_transform = make_batch_transform(args)
-    logger.info(f"train dataset: {len(dataset)} images")
-    train_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=list,  # no collate, variable shapes
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-    )
 
     # model
     model = ViTMAE3D.from_config(args)
@@ -116,15 +112,13 @@ def main(args: DictConfig):
     betas = tuple(args.betas) if args.betas is not None else None
     optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
 
-    epoch_num_batches = len(train_loader)
-    steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
-    total_steps = args.epochs * steps_per_epoch
-    warmup_steps = args.warmup_epochs * steps_per_epoch
-    decay_steps = args.decay_epochs * steps_per_epoch
-    lr_schedule = make_lr_schedule(args.lr, args.min_lr, total_steps, warmup_steps, decay_steps)
-    logger.info(f"full schedule: epochs = {args.epochs} (steps = {total_steps})")
-    logger.info(f"warmup: epochs = {args.warmup_epochs} (steps = {warmup_steps})")
-    logger.info(f"decay: epochs = {args.decay_epochs} (steps = {decay_steps})")
+    lr_schedule = make_lr_schedule(
+        args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
+    )
+    logger.info(
+        f"lr schedule: total steps = {args.total_steps}, warmup = {args.warmup_steps}, "
+        f"decay = {args.decay_steps}"
+    )
 
     # loss scaling not needed for bfloat16 (according to timm)
     if args.amp and args.amp_dtype != "bfloat16":
@@ -133,35 +127,76 @@ def main(args: DictConfig):
         loss_scaler = None
 
     # load checkpoint/resume training
-    misc.load_model(args, model, optimizer, loss_scaler)
+    start_step, train_time = misc.load_model(args, model, optimizer, loss_scaler)
 
-    logger.info(f"start training for {args.epochs} epochs")
-    start_time = time.monotonic()
-    for epoch in range(args.start_epoch, args.epochs):
-        train_stats = train_one_epoch(
-            args,
-            model,
-            train_loader,
-            batch_transform,
-            optimizer,
-            loss_scaler,
-            lr_schedule,
-            epoch,
-            device,
-            batch_flops,
-        )
+    # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
+    dataset = Fomo300kDataset(args.data_root, args.train_filelist)
+    logger.info(f"train dataset: {len(dataset)} images")
+    sampler = InfiniteSampler(
+        len(dataset), seed=args.seed, start=start_step * args.accum_iter * args.batch_size
+    )
+    train_loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        collate_fn=list,  # no collate, variable shapes
+        pin_memory=True,
+        drop_last=True,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        worker_init_fn=ignore_sigterm,
+    )
+    batch_transform = make_batch_transform(args)
 
-        merged_stats = {"epoch": epoch, **train_stats}
-        with (output_dir / "log.json").open("a") as f:
-            print(json.dumps(merged_stats), file=f)
+    # on SIGTERM (e.g. from `timeout`) finish the current step, save and exit cleanly
+    stop_event = threading.Event()
+    signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
 
-        misc.save_model(args, epoch, model, optimizer, loss_scaler)
+    stats = train(
+        args,
+        model,
+        train_loader,
+        batch_transform,
+        optimizer,
+        loss_scaler,
+        lr_schedule,
+        start_step,
+        train_time,
+        device,
+        batch_flops,
+        stop_event,
+    )
 
-    total_time = time.monotonic() - start_time
-    logger.info(f"done! training time: {datetime.timedelta(seconds=int(total_time))}")
+    step = stats["step"]
+    images = step * args.accum_iter * args.batch_size
+    summary = {
+        "step": step,
+        "images": images,
+        "epochs": images / len(dataset),
+        "train_flops": step * args.accum_iter * batch_flops,
+        "train_time": stats["train_time"],
+        "wall_time": time.monotonic() - process_start_time,
+        "start_step": start_step,
+        "stopped_by_signal": stop_event.is_set(),
+        "final_loss": stats["loss"],
+        "num_params": num_params,
+        "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
+        "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "git_sha": misc.git_sha(),
+    }
+    with (output_dir / "summary.json").open("w") as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"summary:\n{json.dumps(summary, indent=2)}")
+    train_time_str = datetime.timedelta(seconds=int(stats["train_time"]))
+    if stop_event.is_set():
+        logger.info(f"stopped by signal at step {step}. training time: {train_time_str}")
+    else:
+        logger.info(f"done! training time: {train_time_str}")
 
 
-def train_one_epoch(
+def train(
     args: DictConfig,
     model: nn.Module,
     data_loader: Iterable,
@@ -169,10 +204,12 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     loss_scaler: torch.GradScaler | None,
     lr_schedule: np.ndarray,
-    epoch: int,
+    start_step: int,
+    train_time: float,
     device: torch.device,
     batch_flops: float,
-):
+    stop_event: threading.Event,
+) -> dict:
     model.train()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -188,32 +225,38 @@ def train_one_epoch(
     metric_logger.add_meter(
         "watts", misc.SmoothedValue(window_size=1, fmt="{value:.0f} ({global_avg:.0f})")
     )
-    header = f"Train: [{epoch}]"
 
     throughput = misc.ThroughputMeter(
         {"vol": args.batch_size, "tflop": batch_flops / 1e12}, device=device
     )
 
-    epoch_num_batches = len(data_loader)
-    steps_per_epoch = math.ceil(epoch_num_batches / args.accum_iter)
+    # steps count optimizer updates, batches count loader batches
+    total_steps = args.total_steps if not args.debug else start_step + 10
+    print_freq = args.print_freq if not args.debug else 1
+    print_freq_batches = print_freq * args.accum_iter
+    num_batches = total_steps * args.accum_iter
+    start_batch = start_step * args.accum_iter
 
-    print_freq = args.get("print_freq", 100) if not args.debug else 1
-    num_batches = epoch_num_batches if not args.debug else 10
     amp_dtype = getattr(torch, args.amp_dtype)
     use_cuda = device.type == "cuda"
+    output_dir = Path(args.output_dir)
+    log_path = output_dir / "log.json"
+    start_time = time.monotonic()
+    step = start_step
 
     optimizer.zero_grad()
 
-    for batch_idx, batch in enumerate(
-        metric_logger.log_every(data_loader, print_freq, header, total_steps=num_batches)
-    ):
-        batch_step = batch_idx + 1
-        log_step = batch_step % print_freq == 0 or batch_step == num_batches
-        update_in_epoch = batch_idx // args.accum_iter
-        group_size = min(args.accum_iter, num_batches - update_in_epoch * args.accum_iter)
-        need_update = batch_step % args.accum_iter == 0 or batch_step == num_batches
-        global_step = epoch * steps_per_epoch + update_in_epoch
-        lr = float(lr_schedule[global_step])
+    batches = metric_logger.log_every(
+        data_loader,
+        print_freq_batches,
+        "Train:",
+        total_steps=num_batches,
+        start_step=start_batch,
+    )
+    for batch_idx, batch in enumerate(batches, start=start_batch):
+        need_update = (batch_idx + 1) % args.accum_iter == 0
+        log_step = (batch_idx + 1) % print_freq_batches == 0
+        lr = float(lr_schedule[step])
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -239,7 +282,7 @@ def train_one_epoch(
         torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
 
         grad_norm = misc.backward_step(
-            loss / group_size,
+            loss / args.accum_iter,
             optimizer,
             scaler=loss_scaler,
             need_update=need_update,
@@ -254,48 +297,56 @@ def train_one_epoch(
         throughput.step()
         if log_step:
             metric_logger.update(**throughput.compute())
+            log_stats = {
+                "step": step + 1,
+                "loss": metric_logger.loss.value,
+                "lr": lr,
+                "grad": metric_logger.grad.value,
+                "vol_per_sec": metric_logger.meters["vol/s"].value,
+                "tflop_per_sec": metric_logger.meters["tflop/s"].value,
+                "watts": metric_logger.meters["watts"].value,
+            }
+            with log_path.open("a") as f:
+                print(json.dumps(log_stats), file=f)
+            if args.wandb:
+                wandb.log({f"train/{k}": v for k, v in log_stats.items()}, step=step + 1)
 
-        if need_update and log_step and args.wandb:
-            wandb.log(
-                {
-                    "train/loss": metric_logger.loss.value,
-                    "train/lr": lr,
-                    "train/grad": metric_logger.grad.value,
-                    "train/vol_per_sec": metric_logger.meters["vol/s"].value,
-                    "train/tflop_per_sec": metric_logger.meters["tflop/s"].value,
-                    "train/watts": metric_logger.meters["watts"].value,
-                },
-                step=int(1000 * (epoch + batch_step / epoch_num_batches)),
-            )
+        if not need_update:
+            continue
+        step += 1
+        is_last = step == total_steps or stop_event.is_set()
 
-    # plot a few images from the last batch
-    num_examples = args.plot_nrow * args.plot_ncol
-    is_plot_epoch = args.plot_period and (epoch % args.plot_period == 0 or epoch == args.epochs - 1)
-    if num_examples and is_plot_epoch:
-        model.eval()
-        example_images = images[:num_examples]
-        example_masks = masks[:num_examples]
-        with (
-            torch.no_grad(),
-            torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp),
-        ):
-            _, state = model(
-                example_images,
-                example_masks,
-                num_visible=args.num_visible,
-                num_predict=args.plot_num_predict,
-                num_samples=1,
-            )
-        model.train()
-        plot_paths = make_plots(args, example_images, example_masks, state, epoch)
-        if args.wandb:
-            wandb.log(
-                {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
-                step=1000 * (epoch + 1),
-            )
+        # plot a few images from the current batch
+        num_examples = args.plot_nrow * args.plot_ncol
+        # not on stop by signal, just save and exit
+        is_plot_step = args.plot_period and (step % args.plot_period == 0 or step == total_steps)
+        if num_examples and is_plot_step:
+            plot_paths = plot_examples(args, model, images, masks, step, amp_dtype, device)
+            if args.wandb:
+                wandb.log(
+                    {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
+                    step=step,
+                )
+
+        is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
+        if is_save_step or is_last:
+            elapsed = train_time + time.monotonic() - start_time
+            misc.save_model(args, step, model, optimizer, loss_scaler, elapsed)
+
+        if is_last:
+            break
 
     logger.info(f"Averaged stats: {metric_logger}")
-    return {f"train/{k}": meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {
+        "step": step,
+        "train_time": train_time + time.monotonic() - start_time,
+        "loss": metric_logger.loss.median,
+    }
+
+
+def ignore_sigterm(worker_id: int):
+    # `timeout` signals the whole process group. workers keep loading until the main process exits
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 
 def make_lr_schedule(
@@ -308,20 +359,39 @@ def make_lr_schedule(
 
 
 def make_batch_transform(args: DictConfig):
-    transform = partial(
-        default_transform,
-        target_spacing=args.target_spacing,
-        grid_size=tuple(args.grid_size),
-        clip_quantiles=tuple(args.clip_quantiles),
-    )
-
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
-        batch = [transform(sample) for sample in batch]
+        batch = [
+            sample_transform(
+                sample,
+                target_spacing=args.target_spacing,
+                grid_size=tuple(args.grid_size),
+                clip_quantiles=tuple(args.clip_quantiles),
+            )
+            for sample in batch
+        ]
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
         return {"image": images, "mask": masks}
 
     return fn
+
+
+def sample_transform(
+    sample: dict[str, Tensor],
+    *,
+    target_spacing: float = 1.0,
+    grid_size: tuple[int, int, int] = (192, 240, 192),
+    clip_quantiles: tuple[float, float] = (0.005, 0.995),
+) -> dict[str, Tensor]:
+    # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
+    values = sample["values"].float() * sample["scale"]
+    values = normalize_values(values, clip_quantiles)
+    mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
+    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
+    image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
+    image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
+    return {"image": image, "mask": mask, "affine": affine}
 
 
 def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:
@@ -345,13 +415,35 @@ def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) 
     return flop_counter.get_total_flops()
 
 
-def make_plots(
+def plot_examples(
     args: DictConfig,
+    model: nn.Module,
     images: Tensor,
     masks: Tensor,
-    state: dict[str, Tensor],
-    epoch: int,
+    step: int,
+    amp_dtype: torch.dtype,
+    device: torch.device,
 ) -> dict[str, Path]:
+    num_examples = args.plot_nrow * args.plot_ncol
+    images = images[:num_examples]
+    masks = masks[:num_examples]
+
+    model.eval()
+    # eager, the plot shapes differ from training and compiling them isn't worth it
+    with (
+        torch.no_grad(),
+        torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp),
+        torch.compiler.set_stance("force_eager"),
+    ):
+        _, state = model(
+            images,
+            masks,
+            num_visible=args.num_visible,
+            num_predict=args.plot_num_predict,
+            num_samples=1,
+        )
+    model.train()
+
     grid_size = tuple(args.grid_size)
     patch_size = args.patch_size
     vis_ids = state["vis_ids"]
@@ -383,7 +475,7 @@ def make_plots(
             nrow=args.plot_nrow,
             ncol=args.plot_ncol,
         )
-        path = plot_dir / f"mae_{view}_{epoch:05d}.png"
+        path = plot_dir / f"mae_{view}_{step:07d}.png"
         fig.savefig(path)
         plt.close(fig)
         plot_paths[f"mae_{view}"] = path

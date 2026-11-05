@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from jaxtyping import Bool, Float
 from torch import Tensor
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 
 class Fomo300kDataset(Dataset):
@@ -44,21 +44,22 @@ class Fomo300kDataset(Dataset):
         return sample
 
 
-def default_transform(
-    sample: dict[str, Tensor],
-    *,
-    target_spacing: float = 1.0,
-    grid_size: tuple[int, int, int] = (192, 240, 192),
-    clip_quantiles: tuple[float, float] = (0.005, 0.995),
-) -> dict[str, Tensor]:
-    values = sample["values"].float() * sample["scale"]
-    values = normalize_values(values, clip_quantiles)
-    mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
-    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
-    image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
-    image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
-    image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
-    return {"image": image, "mask": mask, "affine": affine}
+class InfiniteSampler(Sampler[int]):
+    """Endless shuffled passes over the dataset, starting from sample index `start`."""
+
+    def __init__(self, num_samples: int, seed: int = 0, start: int = 0):
+        self.num_samples = num_samples
+        self.seed = seed
+        self.start = start
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed)
+        index = 0
+        while True:
+            for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
+                if index >= self.start:
+                    yield sample_index
+                index += 1
 
 
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:

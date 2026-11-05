@@ -144,8 +144,8 @@ class MetricLogger:
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None, total_steps=None):
-        i = 0
+    def log_every(self, iterable, print_freq, header=None, total_steps=None, start_step=0):
+        i = start_step
         total_steps = total_steps or len(iterable)
         if not header:
             header = ""
@@ -204,9 +204,8 @@ class MetricLogger:
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        logger.info(
-            f"{header} Total time: {total_time_str} ({total_time / total_steps:.6f} s / it)"
-        )
+        num_steps = max(i - start_step, 1)
+        logger.info(f"{header} Total time: {total_time_str} ({total_time / num_steps:.6f} s / it)")
 
 
 def to_tensor(x: Tensor | float | int) -> Tensor:
@@ -301,15 +300,15 @@ def init_distributed_mode(args):
 # checkpoint saving utils adapted from beit3
 
 
-def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler):
+def save_model(args, step, model_without_ddp, optimizer, loss_scaler, train_time=0.0):
     output_dir = Path(args.output_dir)
-    checkpoint_path = output_dir / f"checkpoint-{epoch:05d}.pth"
     last_checkpoint_path = output_dir / "checkpoint-last.pth"
 
     to_save = {
         "model": model_without_ddp.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "epoch": epoch,
+        "step": step,
+        "train_time": train_time,
         "scaler": None if loss_scaler is None else loss_scaler.state_dict(),
         "args": OmegaConf.to_container(args),
         "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
@@ -319,21 +318,14 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler):
     logger.info(f"saving checkpoint {last_checkpoint_path}")
     save_on_master(to_save, last_checkpoint_path)
 
-    periodic = args.checkpoint_period and (epoch + 1) % args.checkpoint_period == 0
-    listed = args.checkpoint_epochs and (epoch + 1) in args.checkpoint_epochs
-    if periodic or listed:
+    if args.checkpoint_steps and step in args.checkpoint_steps:
+        checkpoint_path = output_dir / f"checkpoint-{step:07d}.pth"
         logger.info(f"saving checkpoint {checkpoint_path}")
         save_on_master(to_save, checkpoint_path)
 
-    if args.max_checkpoints and is_main_process():
-        all_checkpoints = sorted(output_dir.glob("checkpoint-[0-9]*.pth"))
-        del_count = max(0, len(all_checkpoints) - args.max_checkpoints)
-        for checkpoint_path in all_checkpoints[:del_count]:
-            logger.info(f"removing checkpoint {checkpoint_path}")
-            checkpoint_path.unlink()
 
-
-def load_model(args, model_without_ddp, optimizer, loss_scaler):
+def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
+    """Load args.ckpt, or the last checkpoint when auto resuming. Returns (start step, train time)."""
     auto_resume = getattr(args, "auto_resume", True)
     output_dir = Path(args.output_dir)
 
@@ -342,6 +334,8 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         args.ckpt = str(last_checkpoint_path)
         args.resume = True
 
+    start_step = 0
+    train_time = 0.0
     if args.ckpt:
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         model_without_ddp.load_state_dict(ckpt["model"])
@@ -351,8 +345,10 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
             optimizer.load_state_dict(ckpt["optimizer"])
             if loss_scaler is not None:
                 loss_scaler.load_state_dict(ckpt["scaler"])
-            args.start_epoch = ckpt["epoch"] + 1
-            logger.info(f"loaded optimizer state, resuming training from {args.start_epoch}")
+            start_step = ckpt["step"]
+            train_time = ckpt["train_time"]
+            logger.info(f"loaded optimizer state, resuming training from step {start_step}")
+    return start_step, train_time
 
 
 # optimization utils
