@@ -19,6 +19,8 @@ set -euo pipefail
 NAME=$1
 shift
 RUN_DIR="output/${NAME}"
+# brainmarks-smri task group scored by the leaderboard. keep in sync with scripts/submit.py
+TASK_GROUP="open"
 
 if [[ -f .env ]]; then
     set -a
@@ -31,9 +33,11 @@ uv run --no-sync python -m nanobrain.train \
     --overrides output_dir=output name="${NAME}" "$@"
 
 # Evaluate the last checkpoint. Finished tasks are skipped when requeued.
-uv run --no-sync python -m brainmarks_smri vit_mae_3d open \
+uv run --no-sync python -m brainmarks_smri vit_mae_3d "${TASK_GROUP}" \
     --overrides \
     "imports=[nanobrain.model]" \
     model_kwargs.checkpoint="${RUN_DIR}/checkpoint-last.pth" \
     output_dir="${RUN_DIR}" \
     name=eval
+
+echo "To submit: uv run python scripts/submit.py ${RUN_DIR}"

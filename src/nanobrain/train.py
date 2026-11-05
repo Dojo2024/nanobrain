@@ -183,7 +183,7 @@ def main(args: DictConfig):
         "images": images,
         "epochs": images / len(dataset),
         "train_flops": step * args.accum_iter * batch_flops,
-        "wall_time": stats["wall_time"],
+        "wall_seconds": stats["wall_time"],
         "start_step": start_step,
         "done": stats["done"],
         "stopped_by_signal": stop_event.is_set(),
@@ -191,6 +191,7 @@ def main(args: DictConfig):
         "num_params": num_params,
         "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "cpus": len(os.sched_getaffinity(0)),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "git": misc.git_info(),
@@ -498,12 +499,12 @@ def plot_examples(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cfg-path", type=str, default=None)
+    parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--overrides", type=str, default=None, nargs="+")
     args = parser.parse_args()
     cfg = OmegaConf.load(DEFAULT_CONFIG)
-    if args.cfg_path:
-        cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.load(args.cfg_path))
+    if args.config:
+        cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.load(args.config))
     if args.overrides:
         cfg = OmegaConf.unsafe_merge(cfg, OmegaConf.from_dotlist(args.overrides))
     main(cfg)

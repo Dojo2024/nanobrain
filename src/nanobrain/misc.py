@@ -542,16 +542,22 @@ def random_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-# same as brainmarks-smri git_info
+# brainmarks-smri git_info, plus the origin remote
 def git_info(path: Path = Path(__file__).parent) -> dict[str, Any] | None:
-    """Commit, branch and dirty state of the git repo containing `path`; None outside a repo."""
+    """Commit, branch, dirty state and origin of the git repo containing `path`; None outside one."""
     kwargs = dict(cwd=path, capture_output=True, text=True)
     sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kwargs)
     if sha.returncode != 0:
         return None
     branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kwargs).stdout.strip()
     status = subprocess.run(["git", "status", "--porcelain", "-uno"], **kwargs).stdout.strip()
-    return {"sha": sha.stdout.strip(), "branch": branch, "dirty": bool(status)}
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], **kwargs).stdout.strip()
+    return {
+        "sha": sha.stdout.strip(),
+        "branch": branch,
+        "dirty": bool(status),
+        "remote": remote or None,
+    }
 
 
 def snapshot_source(src_dir: Path, path: Path) -> None:
