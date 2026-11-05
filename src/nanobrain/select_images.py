@@ -1,9 +1,10 @@
 """Select the pretraining images from the brainmarks-smri FOMO300K tables.
 
-uv run python -m nanobrain.select_images data/fomo300k src/nanobrain/config/fomo300k_images.txt
+uv run python -m nanobrain.select_images src/nanobrain/config/fomo300k_images.txt
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,9 +14,12 @@ ANAT_SUFFIXES = ("T1w", "T2w", "FLAIR")
 MIN_BRAIN_EXTENT = 100.0  # mm, on every axis
 DWI_SHELL_RANGE = (900, 1100)
 
+# brainmarks-smri data folder, shared with the eval
+DATA_ROOT = Path(os.environ["BRAINMARKS_SMRI_DATA"])
+
 
 def main(args: argparse.Namespace):
-    images = pd.read_parquet(args.root / "tables" / "images.parquet")
+    images = pd.read_parquet(DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
     print(f"all images: {len(images)}")
 
     # one sequence label per image, None for sequences we don't use
@@ -50,7 +54,6 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("root", type=Path, help="brainmarks-smri fomo300k folder")
     parser.add_argument("out", type=Path, help="output filelist of npz paths")
     args = parser.parse_args()
     main(args)

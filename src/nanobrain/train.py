@@ -35,6 +35,8 @@ from nanobrain.visualization import plot_mask_pred
 logger = logging.getLogger()
 
 ROOT = Path(__file__).parents[2]
+# brainmarks-smri data folder, shared with the eval
+DATA_ROOT = Path(os.environ["BRAINMARKS_SMRI_DATA"])
 DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 
 
@@ -138,7 +140,7 @@ def main(args: DictConfig):
     start_step, prev_wall_time = misc.load_model(args, model, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
-    dataset = Fomo300kDataset(args.data_root, args.train_filelist)
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     logger.info(f"train dataset: {len(dataset)} images")
     sampler = InfiniteSampler(
         len(dataset), seed=args.seed, start=start_step * args.accum_iter * args.batch_size

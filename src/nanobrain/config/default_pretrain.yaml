@@ -8,7 +8,6 @@ notes: null
 output_dir: output
 
 # Data.
-data_root: data/fomo300k
 train_filelist: src/nanobrain/config/fomo300k_images.txt
 num_workers: 8
 prefetch_factor: 2
