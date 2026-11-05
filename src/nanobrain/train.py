@@ -34,6 +34,7 @@ from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
 
+ROOT = Path(__file__).parents[2]
 DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 
 
@@ -57,6 +58,22 @@ def main(args: DictConfig):
     else:
         OmegaConf.save(args, out_cfg_path)
 
+    misc.setup_logging(logger, output_dir / "log.txt")
+
+    logger.info("pretraining nanobrain")
+    logger.info(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"cwd: {Path.cwd()}")
+    logger.info(f"git: {misc.git_info()}")
+    if device.type == "cuda":
+        logger.info(f"gpu: {torch.cuda.get_device_name(device)}")
+    logger.info(f"torch: {torch.__version__} (cuda {torch.version.cuda})")
+    logger.info(f"config:\n{OmegaConf.to_yaml(args)}")
+
+    summary_path = output_dir / "summary.json"
+    if summary_path.exists() and json.loads(summary_path.read_text())["done"]:
+        logger.info(f"training already done, see {summary_path}")
+        return
+
     if args.wandb:
         wandb.init(
             entity=args.wandb_entity,
@@ -66,16 +83,7 @@ def main(args: DictConfig):
             config=OmegaConf.to_container(args),
         )
 
-    misc.setup_logging(logger, output_dir / "log.txt")
-
-    logger.info("pretraining nanobrain")
-    logger.info(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"cwd: {Path.cwd()}")
-    logger.info(f"sha: {misc.git_sha()}")
-    if device.type == "cuda":
-        logger.info(f"gpu: {torch.cuda.get_device_name(device)}")
-    logger.info(f"torch: {torch.__version__} (cuda {torch.version.cuda})")
-    logger.info(f"config:\n{OmegaConf.to_yaml(args)}")
+    misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
 
     # model
     model = ViTMAE3D.from_config(args)
@@ -127,7 +135,7 @@ def main(args: DictConfig):
         loss_scaler = None
 
     # load checkpoint/resume training
-    start_step, train_time = misc.load_model(args, model, optimizer, loss_scaler)
+    start_step, prev_wall_time = misc.load_model(args, model, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
     dataset = Fomo300kDataset(args.data_root, args.train_filelist)
@@ -148,7 +156,7 @@ def main(args: DictConfig):
     )
     batch_transform = make_batch_transform(args)
 
-    # on SIGTERM (e.g. from `timeout`) finish the current step, save and exit cleanly
+    # on SIGTERM (e.g. preemption) finish the current step, save and exit. resumes when relaunched
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
 
@@ -161,7 +169,8 @@ def main(args: DictConfig):
         loss_scaler,
         lr_schedule,
         start_step,
-        train_time,
+        prev_wall_time,
+        process_start_time,
         device,
         batch_flops,
         stop_event,
@@ -174,9 +183,9 @@ def main(args: DictConfig):
         "images": images,
         "epochs": images / len(dataset),
         "train_flops": step * args.accum_iter * batch_flops,
-        "train_time": stats["train_time"],
-        "wall_time": time.monotonic() - process_start_time,
+        "wall_time": stats["wall_time"],
         "start_step": start_step,
+        "done": stats["done"],
         "stopped_by_signal": stop_event.is_set(),
         "final_loss": stats["loss"],
         "num_params": num_params,
@@ -184,16 +193,16 @@ def main(args: DictConfig):
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
-        "git_sha": misc.git_sha(),
+        "git": misc.git_info(),
     }
-    with (output_dir / "summary.json").open("w") as f:
+    with summary_path.open("w") as f:
         json.dump(summary, f, indent=2)
     logger.info(f"summary:\n{json.dumps(summary, indent=2)}")
-    train_time_str = datetime.timedelta(seconds=int(stats["train_time"]))
-    if stop_event.is_set():
-        logger.info(f"stopped by signal at step {step}. training time: {train_time_str}")
+    wall_time_str = datetime.timedelta(seconds=int(stats["wall_time"]))
+    if stats["done"]:
+        logger.info(f"done! step {step}, wall time: {wall_time_str}")
     else:
-        logger.info(f"done! training time: {train_time_str}")
+        logger.info(f"stopped by signal at step {step}. wall time: {wall_time_str}")
 
 
 def train(
@@ -205,7 +214,8 @@ def train(
     loss_scaler: torch.GradScaler | None,
     lr_schedule: np.ndarray,
     start_step: int,
-    train_time: float,
+    prev_wall_time: float,
+    start_time: float,
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
@@ -241,8 +251,10 @@ def train(
     use_cuda = device.type == "cuda"
     output_dir = Path(args.output_dir)
     log_path = output_dir / "log.json"
-    start_time = time.monotonic()
+    # time limit on wall time from the start of main, summed over restarts
+    time_limit = args.time_limit * 60 if args.time_limit else float("inf")
     step = start_step
+    done = False
 
     optimizer.zero_grad()
 
@@ -314,12 +326,14 @@ def train(
         if not need_update:
             continue
         step += 1
-        is_last = step == total_steps or stop_event.is_set()
+        wall_time = prev_wall_time + time.monotonic() - start_time
+        done = step == total_steps or wall_time >= time_limit
+        is_last = done or stop_event.is_set()
 
         # plot a few images from the current batch
         num_examples = args.plot_nrow * args.plot_ncol
         # not on stop by signal, just save and exit
-        is_plot_step = args.plot_period and (step % args.plot_period == 0 or step == total_steps)
+        is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
         if num_examples and is_plot_step:
             plot_paths = plot_examples(args, model, images, masks, step, amp_dtype, device)
             if args.wandb:
@@ -330,8 +344,7 @@ def train(
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
-            elapsed = train_time + time.monotonic() - start_time
-            misc.save_model(args, step, model, optimizer, loss_scaler, elapsed)
+            misc.save_model(args, step, model, optimizer, loss_scaler, wall_time)
 
         if is_last:
             break
@@ -339,7 +352,8 @@ def train(
     logger.info(f"Averaged stats: {metric_logger}")
     return {
         "step": step,
-        "train_time": train_time + time.monotonic() - start_time,
+        "done": done,
+        "wall_time": prev_wall_time + time.monotonic() - start_time,
         "loss": metric_logger.loss.median,
     }
 

@@ -1,6 +1,6 @@
 """Select the pretraining images from the brainmarks-smri FOMO300K tables.
 
-uv run python scripts/select_images.py data/fomo300k src/nanobrain/config/fomo300k_images.txt
+uv run python -m nanobrain.select_images data/fomo300k src/nanobrain/config/fomo300k_images.txt
 """
 
 import argparse

@@ -12,10 +12,12 @@ import os
 import random
 import subprocess
 import sys
+import tarfile
 import time
 from collections import defaultdict, deque
 from omegaconf import OmegaConf
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -300,7 +302,7 @@ def init_distributed_mode(args):
 # checkpoint saving utils adapted from beit3
 
 
-def save_model(args, step, model_without_ddp, optimizer, loss_scaler, train_time=0.0):
+def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=0.0):
     output_dir = Path(args.output_dir)
     last_checkpoint_path = output_dir / "checkpoint-last.pth"
 
@@ -308,11 +310,11 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, train_time
         "model": model_without_ddp.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
-        "train_time": train_time,
+        "wall_time": wall_time,
         "scaler": None if loss_scaler is None else loss_scaler.state_dict(),
         "args": OmegaConf.to_container(args),
         "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
-        "git_sha": git_sha(),
+        "git": git_info(),
     }
 
     logger.info(f"saving checkpoint {last_checkpoint_path}")
@@ -325,7 +327,7 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, train_time
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
-    """Load args.ckpt, or the last checkpoint when auto resuming. Returns (start step, train time)."""
+    """Load args.ckpt, or the last checkpoint when auto resuming. Returns (start step, wall time)."""
     auto_resume = getattr(args, "auto_resume", True)
     output_dir = Path(args.output_dir)
 
@@ -335,7 +337,7 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, fl
         args.resume = True
 
     start_step = 0
-    train_time = 0.0
+    wall_time = 0.0
     if args.ckpt:
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         model_without_ddp.load_state_dict(ckpt["model"])
@@ -346,9 +348,9 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, fl
             if loss_scaler is not None:
                 loss_scaler.load_state_dict(ckpt["scaler"])
             start_step = ckpt["step"]
-            train_time = ckpt["train_time"]
+            wall_time = ckpt["wall_time"]
             logger.info(f"loaded optimizer state, resuming training from step {start_step}")
-    return start_step, train_time
+    return start_step, wall_time
 
 
 # optimization utils
@@ -540,11 +542,29 @@ def random_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def git_sha() -> str:
-    kwargs = dict(cwd=Path(__file__).parent, capture_output=True, text=True, check=True)
-    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kwargs).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain", "-uno"], **kwargs).stdout.strip()
-    return f"{sha}-dirty" if dirty else sha
+# same as brainmarks-smri git_info
+def git_info(path: Path = Path(__file__).parent) -> dict[str, Any] | None:
+    """Commit, branch and dirty state of the git repo containing `path`; None outside a repo."""
+    kwargs = dict(cwd=path, capture_output=True, text=True)
+    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kwargs)
+    if sha.returncode != 0:
+        return None
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kwargs).stdout.strip()
+    status = subprocess.run(["git", "status", "--porcelain", "-uno"], **kwargs).stdout.strip()
+    return {"sha": sha.stdout.strip(), "branch": branch, "dirty": bool(status)}
+
+
+def snapshot_source(src_dir: Path, path: Path) -> None:
+    """Save `src_dir` as a .tar.gz archive at `path`, without python caches."""
+
+    def exclude_caches(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        name = Path(info.name).name
+        if name == "__pycache__" or name.endswith((".pyc", ".egg-info")):
+            return None
+        return info
+
+    with tarfile.open(path, "w:gz") as tar:
+        tar.add(src_dir, arcname=src_dir.name, filter=exclude_caches)
 
 
 def setup_logging(logger: logging.Logger, log_path: Path | None = None) -> None:

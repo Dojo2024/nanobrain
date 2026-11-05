@@ -21,6 +21,7 @@ _version.py
 
 # Local data/output directories
 /data/
+/output/
 wandb/
 
 # Large files
