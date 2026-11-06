@@ -45,19 +45,24 @@ class Fomo300kDataset(Dataset):
 
 
 class InfiniteSampler(Sampler[int]):
-    """Endless shuffled passes over the dataset, starting from sample index `start`."""
+    """Endless shuffled passes over the dataset, starting from sample index `start`. With ddp
+    each rank takes every world_size-th sample of the same stream."""
 
-    def __init__(self, num_samples: int, seed: int = 0, start: int = 0):
+    def __init__(
+        self, num_samples: int, seed: int = 0, start: int = 0, rank: int = 0, world_size: int = 1
+    ):
         self.num_samples = num_samples
         self.seed = seed
         self.start = start
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
         while True:
             for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
-                if index >= self.start:
+                if index >= self.start and index % self.world_size == self.rank:
                     yield sample_index
                 index += 1
 

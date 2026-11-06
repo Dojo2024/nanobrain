@@ -35,7 +35,7 @@ model_kwargs:
   class_tokens: 0
   drop_path_rate: 0.0
 
-# Optimization. batch_size is images per step; each gives num_samples sequences.
+# Optimization. batch_size is images per step per gpu; each gives num_samples sequences.
 batch_size: 32
 accum_iter: 1
 
@@ -48,14 +48,31 @@ time_limit: 60
 total_steps: 22500
 warmup_steps: 6750
 decay_steps: 0
+# or the schedule in epochs of train_filelist (overrides the three step counts; null = off)
+epochs: null
+warmup_epochs: 0
+decay_epochs: 0
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true
+# adamw, or muon for the block matrices (adamw for the rest). muon's update is scaled to
+# adamw's rms, so it shares the lr schedule, times muon_lr_mult.
+optimizer: adamw
+muon_lr_mult: 1.0
+muon_momentum: 0.95
+muon_encoder_only: false
+muon_decoder_only: false
+# muon on every 2d weight (patch embed, decoder proj, heads too), not just the blocks
+muon_all_matrices: false
+# compiled muon step: fused momentum/cast/update kernels, grad clip folded in
+muon_fused: false
 
 amp: true
 amp_dtype: bfloat16
 compile: true
+# sdpa flash backend, e.g. FA3 (null = torch default)
+flash_attention_impl: null
 
 # Checkpointing. checkpoint-last.pth is overwritten every checkpoint_period steps and at the end.
 # checkpoint_steps lists steps to also keep as numbered checkpoints.
@@ -74,6 +91,8 @@ plot_ncol: 2
 plot_num_predict: null
 
 device: cuda
+# multi gpu ddp, launched with torchrun (scripts/train_ddp.sbatch); false = one gpu
+distributed: false
 seed: 7338
 debug: false
 

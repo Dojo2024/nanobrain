@@ -27,12 +27,22 @@ class Attention(nn.Module):
         proj_bias: bool = False,
         context_dim: int | None = None,
         causal: bool = False,
+        qk_norm: bool = False,
+        qk_scale_init: float = 1.0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.causal = causal
         context_dim = context_dim or dim
+
+        # qk norm caps the logits at ~sqrt(head_dim), so a learned per head scale (init
+        # qk_scale_init) lets them grow back
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = LayerNorm(self.head_dim)
+            self.k_norm = LayerNorm(self.head_dim)
+            self.qk_scale = nn.Parameter(torch.full((num_heads, 1, 1), float(qk_scale_init)))
 
         # using separate q, k, v weights so that xavier init uses the correct dim.
         # although perhaps technically it should be initialized wrt the head dim..
@@ -59,6 +69,9 @@ class Attention(nn.Module):
         q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
         k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
         v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
+        if self.qk_norm:
+            q = self.q_norm(q) * self.qk_scale.to(q.dtype)
+            k = self.k_norm(k)
         x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
@@ -100,6 +113,8 @@ class Block(nn.Module):
         mlp_ratio: int | float = 4,
         drop_path: float = 0.0,
         norm_layer: Layer = LayerNorm,
+        qk_norm: bool = False,
+        qk_scale_init: float = 1.0,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -109,6 +124,8 @@ class Block(nn.Module):
             qkv_bias=qkv_bias,
             proj_bias=proj_bias,
             context_dim=context_dim,
+            qk_norm=qk_norm,
+            qk_scale_init=qk_scale_init,
         )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
