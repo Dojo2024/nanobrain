@@ -1,0 +1,3 @@
+[18:26:09] pretraining nanobrain
+[18:26:09] start: 2026-11-06 18:26:09
+[18:26:09] cwd: /admin/home/dojo/nanobrain-v3

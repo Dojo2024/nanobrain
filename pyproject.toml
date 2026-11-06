@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanobrain"
+description = "nanobrain"
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "brainmarks-smri",
+    "einops",
+    "jaxtyping",
+    "matplotlib",
+    "nibabel",
+    "numpy",
+    "nvidia-ml-py",
+    "omegaconf",
+    "pandas",
+    "timm",
+    "torch==2.14.0",
+    "torchvision",
+    "wandb",
+]
+
+[dependency-groups]
+dev = [
+    "ipython",
+    "jupyter",
+    "matplotlib",
+    "pre-commit",
+    "pytest",
+    "python-dotenv",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["F722"]
+
+[tool.uv]
+python-preference = "only-system"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+brainmarks-smri = { git = "https://github.com/MedARC-AI/brainmarks-smri.git", rev = "647c340aaaace123cbbbd35cd81b24a887f4572f" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

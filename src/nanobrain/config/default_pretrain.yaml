@@ -1,0 +1,83 @@
+# Name of the run. Used for output directory suffix and wandb.
+name: nanobrain
+
+# Description of the run. Goes in wandb notes.
+notes: null
+
+# Root output directory. The run writes to <output_dir>/<name> when name is set.
+output_dir: output
+
+# Data.
+data_root: data/fomo300k
+train_filelist: src/nanobrain/config/fomo300k_images.txt
+num_workers: 8
+prefetch_factor: 2
+
+# Fixed 1mm grid that all images are fit to.
+# todo: decide whether the grid should be a config option or constant
+grid_size: [192, 240, 192]
+patch_size: 8
+
+# Sequence sampling. ~3200 brain mask patches per image on average, so num_visible 640 is a
+# ~0.8 mask ratio.
+num_visible: 640
+num_predict: 640
+num_samples: 2
+# Progressive masking (nanobrain-v3): linear ramp of the visible-patch count
+# over the run, from visible_ramp_start to visible_ramp_end (= num_visible).
+# null disables the schedule and keeps num_visible fixed.
+visible_ramp_start: null
+visible_ramp_end: null
+
+# Model (ViT-S encoder).
+model_kwargs:
+  depth: 12
+  embed_dim: 384
+  num_heads: 6
+  decoder_depth: 4
+  decoder_embed_dim: 512
+  decoder_num_heads: 8
+  class_tokens: 1
+  drop_path_rate: 0.0
+
+# Optimization. batch_size is images per step; each gives num_samples sequences.
+epochs: 40
+batch_size: 32
+accum_iter: 1
+
+base_lr: 0.001
+lr: null
+min_lr: 1e-6
+warmup_epochs: 5
+weight_decay: 0.05
+betas: [0.9, 0.95]
+clip_grad: 1.0
+fused_adamw: true
+
+amp: true
+amp_dtype: bfloat16
+compile: true
+
+# Checkpointing.
+ckpt: null
+resume: false
+auto_resume: true
+start_epoch: 0
+checkpoint_period: 10
+max_checkpoints: 5
+
+# Logging.
+print_freq: 100
+plot_period: 5
+plot_nrow: 4
+plot_ncol: 2
+# Number of patches to predict for plotting. null predicts all unseen mask patches.
+plot_num_predict: null
+
+device: cuda
+seed: 7338
+debug: false
+
+wandb: false
+wandb_entity: null
+wandb_project: nanobrain
