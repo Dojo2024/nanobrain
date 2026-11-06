@@ -1,6 +1,6 @@
 """Select the pretraining images from the brainmarks-smri FOMO300K tables.
 
-uv run python -m nanobrain.select_images src/nanobrain/config/fomo300k_images.txt
+uv run python -m nanobrain.select_images --qc-only src/nanobrain/config/fomo300k_images_qc.txt
 """
 
 import argparse
@@ -30,8 +30,9 @@ def main(args: argparse.Namespace):
     sequence[images["dwi_type"] == "b0"] = "dwi_b0"
     sequence[is_shell] = "dwi_b1000"
     images["sequence"] = sequence
-    images = images[images["sequence"].notna()]
-    print(f"sequences {sorted(images['sequence'].unique())}: {len(images)}")
+    if not args.qc_only:
+        images = images[images["sequence"].notna()]
+        print(f"sequences {sorted(images['sequence'].unique())}: {len(images)}")
 
     images = images[images["warnings"].map(len) == 0]
     print(f"no qc warnings: {len(images)}")
@@ -40,11 +41,12 @@ def main(args: argparse.Namespace):
     images = images[brain_extent.min(axis=1) >= MIN_BRAIN_EXTENT]
     print(f"brain extent >= {MIN_BRAIN_EXTENT:.0f} mm: {len(images)}")
 
-    # first image by path per (subject, sequence); subject ids repeat across collections
     images = images.sort_values("path")
-    images = images.drop_duplicates(["collection", "subject", "sequence"])
-    print(f"one per (subject, sequence): {len(images)}")
-    print(images["sequence"].value_counts().to_string())
+    if not args.qc_only:
+        # first image by path per (subject, sequence); subject ids repeat across collections
+        images = images.drop_duplicates(["collection", "subject", "sequence"])
+        print(f"one per (subject, sequence): {len(images)}")
+    print(images["sequence"].fillna("other").value_counts().to_string())
 
     paths = "derivatives/" + images["path"].str.removeprefix("source/").str.removesuffix(".nii.gz")
     paths = paths + ".npz"
@@ -55,5 +57,10 @@ def main(args: argparse.Namespace):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("out", type=Path, help="output filelist of npz paths")
+    parser.add_argument(
+        "--qc-only",
+        action="store_true",
+        help="only the qc warning and brain extent filters: every sequence, every repeat image",
+    )
     args = parser.parse_args()
     main(args)

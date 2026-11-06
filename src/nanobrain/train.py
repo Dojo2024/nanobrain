@@ -11,11 +11,14 @@ from typing import Callable, Iterable
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import wandb
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
 from torch import Tensor
+from torch.nn.attention import activate_flash_attention_impl, current_flash_attention_impl
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.flop_counter import FlopCounterMode
 
@@ -30,6 +33,7 @@ from nanobrain.data import (
     resample_to_spacing,
 )
 from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
 logger = logging.getLogger()
@@ -43,22 +47,29 @@ DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
 def main(args: DictConfig):
     # setup
     process_start_time = time.monotonic()
-    assert int(os.environ.get("WORLD_SIZE", 1)) == 1, "distributed training not supported"
+    if args.distributed:
+        # ddp under torchrun, one process per gpu. batch_size is per gpu
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        dist.init_process_group(backend="nccl")
+    rank, world_size = misc.get_rank(), misc.get_world_size()
     device = torch.device(args.device)
-    misc.random_seed(args.seed)
+    # the ranks draw different views; rank 0's model init is broadcast by ddp
+    misc.random_seed(args.seed + rank)
 
     if args.name and not args.output_dir.endswith(args.name):
         args.output_dir = f"{args.output_dir}/{args.name}"
     output_dir = Path(args.output_dir)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "plots").mkdir(exist_ok=True)
-    out_cfg_path = output_dir / "config.yaml"
-    if out_cfg_path.exists():
-        prev_cfg = OmegaConf.load(out_cfg_path)
-        assert args == prev_cfg, "current config doesn't match previous config"
-    else:
-        OmegaConf.save(args, out_cfg_path)
+    if misc.is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "plots").mkdir(exist_ok=True)
+        out_cfg_path = output_dir / "config.yaml"
+        if out_cfg_path.exists():
+            prev_cfg = OmegaConf.load(out_cfg_path)
+            assert args == prev_cfg, "current config doesn't match previous config"
+        else:
+            OmegaConf.save(args, out_cfg_path)
+    args.wandb = args.wandb and misc.is_main_process()
 
     misc.setup_logging(logger, output_dir / "log.txt")
 
@@ -85,7 +96,15 @@ def main(args: DictConfig):
             config=OmegaConf.to_container(args),
         )
 
-    misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
+    if misc.is_main_process():
+        misc.snapshot_source(ROOT / "src", output_dir / "source.tar.gz")
+
+    if args.flash_attention_impl:
+        # e.g. FA3 (flash-attn-3), with sdpa's cudnn / mem efficient backends off so flash runs
+        activate_flash_attention_impl(args.flash_attention_impl)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        logger.info(f"flash attention impl: {current_flash_attention_impl()}")
 
     # model
     model = ViTMAE3D.from_config(args)
@@ -95,7 +114,11 @@ def main(args: DictConfig):
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
     batch_flops = count_batch_flops(args, model, device)
-    logger.info(f"flops per batch (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+    logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+
+    model_without_ddp = model
+    if args.distributed:
+        model = DDP(model, broadcast_buffers=False)
 
     if args.compile:
         # in place compile keeps the state dict keys
@@ -103,10 +126,11 @@ def main(args: DictConfig):
 
     # optimizer
     # batch size counts sequences, following mae_st which scales by repeated samples
-    total_batch_size = args.batch_size * args.num_samples * args.accum_iter
+    total_batch_size = args.batch_size * world_size * args.num_samples * args.accum_iter
     logger.info(
         f"total batch size: {total_batch_size} = "
-        f"{args.batch_size} images x {args.num_samples} samples x {args.accum_iter} accum"
+        f"{args.batch_size} images x {args.num_samples} samples x {args.accum_iter} accum "
+        f"x {world_size} gpus"
     )
 
     if not args.get("lr"):
@@ -115,12 +139,18 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    param_groups = misc.get_param_groups(model)
-    misc.update_lr(param_groups, args.lr)
-    misc.update_wd(param_groups, args.weight_decay)
-    # cast or else it corrupts the checkpoint
-    betas = tuple(args.betas) if args.betas is not None else None
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    optimizer = make_optimizer(args, model_without_ddp)
+
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    logger.info(f"train dataset: {len(dataset)} images")
+
+    if args.epochs:
+        # schedule in epochs: the step counts follow from the dataset size and the global batch
+        steps_per_epoch = len(dataset) / (args.batch_size * world_size * args.accum_iter)
+        args.total_steps = round(args.epochs * steps_per_epoch)
+        args.warmup_steps = round(args.warmup_epochs * steps_per_epoch)
+        args.decay_steps = round(args.decay_epochs * steps_per_epoch)
+        logger.info(f"{args.epochs} epochs of {steps_per_epoch:.1f} steps")
 
     lr_schedule = make_lr_schedule(
         args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
@@ -137,13 +167,15 @@ def main(args: DictConfig):
         loss_scaler = None
 
     # load checkpoint/resume training
-    start_step, prev_wall_time = misc.load_model(args, model, optimizer, loss_scaler)
+    start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
-    logger.info(f"train dataset: {len(dataset)} images")
     sampler = InfiniteSampler(
-        len(dataset), seed=args.seed, start=start_step * args.accum_iter * args.batch_size
+        len(dataset),
+        seed=args.seed,
+        start=start_step * args.accum_iter * args.batch_size * world_size,
+        rank=rank,
+        world_size=world_size,
     )
     train_loader = DataLoader(
         dataset,
@@ -165,6 +197,7 @@ def main(args: DictConfig):
     stats = train(
         args,
         model,
+        model_without_ddp,
         train_loader,
         batch_transform,
         optimizer,
@@ -178,13 +211,18 @@ def main(args: DictConfig):
         stop_event,
     )
 
+    if args.distributed:
+        dist.destroy_process_group()
+    if not misc.is_main_process():
+        return
+
     step = stats["step"]
-    images = step * args.accum_iter * args.batch_size
+    images = step * args.accum_iter * args.batch_size * world_size
     summary = {
         "step": step,
         "images": images,
         "epochs": images / len(dataset),
-        "train_flops": step * args.accum_iter * batch_flops,
+        "train_flops": step * args.accum_iter * batch_flops * world_size,
         "wall_seconds": stats["wall_time"],
         "start_step": start_step,
         "done": stats["done"],
@@ -193,6 +231,7 @@ def main(args: DictConfig):
         "num_params": num_params,
         "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "num_gpus": world_size,
         "cpus": len(os.sched_getaffinity(0)),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -211,6 +250,7 @@ def main(args: DictConfig):
 def train(
     args: DictConfig,
     model: nn.Module,
+    model_without_ddp: nn.Module,
     data_loader: Iterable,
     batch_transform: Callable,
     optimizer: torch.optim.Optimizer,
@@ -239,8 +279,10 @@ def train(
         "watts", misc.SmoothedValue(window_size=1, fmt="{value:.0f} ({global_avg:.0f})")
     )
 
+    # vol/s counts all gpus, tflop/s is per gpu
     throughput = misc.ThroughputMeter(
-        {"vol": args.batch_size, "tflop": batch_flops / 1e12}, device=device
+        {"vol": args.batch_size * misc.get_world_size(), "tflop": batch_flops / 1e12},
+        device=device,
     )
 
     # steps count optimizer updates, batches count loader batches
@@ -251,7 +293,6 @@ def train(
     start_batch = start_step * args.accum_iter
 
     amp_dtype = getattr(torch, args.amp_dtype)
-    use_cuda = device.type == "cuda"
     output_dir = Path(args.output_dir)
     log_path = output_dir / "log.json"
     # time limit on wall time from the start of main, summed over restarts
@@ -275,8 +316,7 @@ def train(
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
-        if use_cuda:
-            batch = misc.send_data(batch, device)
+        batch = misc.send_data(batch, device)
 
         # run volume processing on gpu, not cpu workers, ~25x faster
         batch = batch_transform(batch)
@@ -321,8 +361,9 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
-            with log_path.open("a") as f:
-                print(json.dumps(log_stats), file=f)
+            if misc.is_main_process():
+                with log_path.open("a") as f:
+                    print(json.dumps(log_stats), file=f)
             if args.wandb:
                 wandb.log({f"train/{k}": v for k, v in log_stats.items()}, step=step + 1)
 
@@ -332,13 +373,20 @@ def train(
         wall_time = prev_wall_time + time.monotonic() - start_time
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
+        if args.distributed:
+            # every rank stops with rank 0, else the others hang in the next all-reduce
+            flags = torch.tensor([done, is_last], dtype=torch.int32, device=device)
+            dist.broadcast(flags, src=0)
+            done, is_last = (bool(f) for f in flags.tolist())
 
         # plot a few images from the current batch
         num_examples = args.plot_nrow * args.plot_ncol
         # not on stop by signal, just save and exit
         is_plot_step = args.plot_period and (step % args.plot_period == 0 or done)
-        if num_examples and is_plot_step:
-            plot_paths = plot_examples(args, model, images, masks, step, amp_dtype, device)
+        if num_examples and is_plot_step and misc.is_main_process():
+            plot_paths = plot_examples(
+                args, model_without_ddp, images, masks, step, amp_dtype, device
+            )
             if args.wandb:
                 wandb.log(
                     {f"train/{name}": wandb.Image(str(path)) for name, path in plot_paths.items()},
@@ -347,7 +395,7 @@ def train(
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
-            misc.save_model(args, step, model, optimizer, loss_scaler, wall_time)
+            misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
 
         if is_last:
             break
@@ -359,6 +407,42 @@ def train(
         "wall_time": prev_wall_time + time.monotonic() - start_time,
         "loss": metric_logger.loss.median,
     }
+
+
+def make_optimizer(args: DictConfig, model: nn.Module):
+    # cast or else it corrupts the checkpoint
+    betas = tuple(args.betas) if args.betas is not None else None
+    if args.optimizer == "adamw":
+        param_groups = misc.get_param_groups(model)
+        misc.update_lr(param_groups, args.lr)
+        misc.update_wd(param_groups, args.weight_decay)
+        return torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
+    assert args.optimizer == "muon", f"unknown optimizer {args.optimizer}"
+    # muon for the block matrices, adamw for the rest (embeddings, head, norms, biases)
+    muon_names = [
+        n
+        for n, p in model.named_parameters()
+        if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
+    ]
+    logger.info(f"muon params: {len(muon_names)} matrices")
+    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+    params = dict(model.named_parameters())
+    muon_groups = [
+        {
+            "params": [params[n] for n in muon_names],
+            "lr_multiplier": args.muon_lr_mult,
+            "wd_multiplier": 1.0,
+        }
+    ]
+    for groups in (adamw_groups, muon_groups):
+        misc.update_lr(groups, args.lr)
+        misc.update_wd(groups, args.weight_decay)
+    return CombinedOptimizer(
+        [
+            torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw),
+            Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
+        ]
+    )
 
 
 def ignore_sigterm(worker_id: int):

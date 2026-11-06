@@ -38,6 +38,10 @@ class ViTMAE3D(nn.Module):
         class_tokens: int = 1,
         drop_path_rate: float = 0.0,
         clip_quantiles: tuple[float, float] = (0.005, 0.995),
+        qk_norm: bool = False,
+        decoder_qk_norm: bool = False,
+        qk_scale_init: float = 1.0,
+        mask_cube: int = 0,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -47,7 +51,9 @@ class ViTMAE3D(nn.Module):
         self.embed_dim = embed_dim
         self.class_tokens = class_tokens
         patch_grid_size = tuple(size // patch_size for size in grid_size)
+        self.patch_grid_size = patch_grid_size
         self.clip_quantiles = clip_quantiles
+        self.mask_cube = mask_cube
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -72,6 +78,8 @@ class ViTMAE3D(nn.Module):
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
                     drop_path=dpr[ii],
+                    qk_norm=qk_norm,
+                    qk_scale_init=qk_scale_init,
                 )
                 for ii in range(depth)
             ]
@@ -91,6 +99,8 @@ class ViTMAE3D(nn.Module):
                     qkv_bias=qkv_bias,
                     proj_bias=proj_bias,
                     mlp_ratio=mlp_ratio,
+                    qk_norm=decoder_qk_norm,
+                    qk_scale_init=qk_scale_init,
                 )
                 for ii in range(decoder_depth)
             ]
@@ -183,7 +193,8 @@ class ViTMAE3D(nn.Module):
         # sample num_samples sequences per image, then flatten them into the batch
         # num_predict None predicts all remaining patches (dense decoding)
         seq_length = None if num_predict is None else num_visible + num_predict
-        order = sample_sequences(mask_patches, num_samples, seq_length)
+        cube = (self.patch_grid_size, self.mask_cube) if self.mask_cube else None
+        order = sample_sequences(mask_patches, num_samples, seq_length, cube=cube)
         num_predict = order.shape[2] - num_visible
         batch_ids = torch.arange(B, device=images.device)[:, None, None]
         patches = patches[batch_ids, order].flatten(0, 1)
@@ -349,12 +360,29 @@ def sample_sequences(
     num_samples: int,
     seq_length: int | None = None,
     min_mask_frac: float = 0.25,
+    cube: tuple[tuple[int, int, int], int] | None = None,
 ) -> torch.Tensor:
     batch_size, num_patches, _ = mask_patches.shape
     mask_frac = mask_patches.mean(dim=2)
     # one independent shuffle per sequence, with patches outside the mask sorted last so
     # they are only used when a volume has too few mask patches
     scores = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    if cube is not None:
+        # cube: (patch grid, edge in patches). one uniform score per cube, shared by its patches,
+        # so they are ordered (visible / predicted) together; the white noise only breaks ties
+        # inside a cube. The cube grid is shifted by a random offset per sequence, so no two
+        # patches are always in the same cube
+        grid, edge = cube
+        num_seq = batch_size * num_samples
+        axes = [torch.arange(size, device=scores.device) for size in grid]
+        coords = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(1, num_patches, 3)
+        offset = torch.randint(0, edge, (num_seq, 1, 3), device=scores.device)
+        cells = (coords + offset) // edge
+        cx, cy, cz = [size // edge + 2 for size in grid]
+        cell_ids = (cells[..., 0] * cy + cells[..., 1]) * cz + cells[..., 2]
+        cell_scores = torch.rand(num_seq, cx * cy * cz, device=scores.device)
+        cell_scores = torch.gather(cell_scores, 1, cell_ids).reshape(batch_size, num_samples, num_patches)
+        scores = cell_scores + 1e-6 * scores
     scores = torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
     if seq_length is None:
         # one host sync to get the longest mask sequence in the batch
