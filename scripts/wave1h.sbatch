@@ -60,6 +60,19 @@ rampdown)     EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
                   visible_ramp_start=1024 visible_ramp_end=384 ) ;;
 champ2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 ); TRAIN_CAP="120m" ;;
 muonx2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ); TRAIN_CAP="120m" ;;
+# --- next screening wave (2 seeds each) ---
+# leader's data recipe (qc-filtered filelist) on our model; clip_quantiles already our default
+champqc)      EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0035
+                  train_filelist=src/nanobrain/config/fomo300k_images_qc.txt ) ;;
+# width axis with a schedule that completes inside the hour (measured ~0.12 s/it, <~10 epochs fit)
+w1152a)       EXTRA=( epochs=9 warmup_epochs=2 base_lr=0.0035 model_kwargs.embed_dim=1152 ) ;;
+# opposite curriculum: harder task first
+rampup)       EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
+                  visible_ramp_start=384 visible_ramp_end=1024 ) ;;
+# one extra sample sequence per image (richer steps at 1.5x cost; bs64/ns4 OOM'd)
+ns3)          EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035 num_samples=3 ) ;;
+# muon x2 tracked better than champ at ep4 (0.70 vs 0.72); give it a completing schedule too
+muonx2a)      EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
 *)            echo "unknown arm ${ARM}" >&2; exit 2 ;;
 esac
 
