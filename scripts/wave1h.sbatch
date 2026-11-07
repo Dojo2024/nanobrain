@@ -55,12 +55,18 @@ w1152)        EXTRA=( epochs=12 warmup_epochs=2 base_lr=0.0035 model_kwargs.embe
 champ-muonx2) EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
 speedchamp)   EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0032
                   batch_size=64 accum_iter=1 num_samples=4 num_predict=1280 ) ;;
+anneal)       EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 ) ;;
+rampdown)     EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
+                  visible_ramp_start=1024 visible_ramp_end=384 ) ;;
+champ2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 ); TRAIN_CAP="120m" ;;
+muonx2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ); TRAIN_CAP="120m" ;;
 *)            echo "unknown arm ${ARM}" >&2; exit 2 ;;
 esac
 
-# 60-minute training cap (timeout exits 124 when it stops training: expected)
+# training cap, in minutes (timeout exits 124 when it stops training: expected)
+TRAIN_CAP="${TRAIN_CAP:-60m}"
 status=0
-timeout --kill-after=2m "60m" \
+timeout --kill-after=2m "${TRAIN_CAP}" \
     .venv/bin/python -m nanobrain.train \
     --overrides name="${NAME}" output_dir=output "${COMMON[@]}" "${EXTRA[@]}" \
     || status=$?
