@@ -18,7 +18,8 @@
 set -euo pipefail
 cd /admin/home/dojo/nanobrain-sweep
 
-RUN_DIR="${1:?output dir of the arm, e.g. iso/base-e768-d12/base-e768-d12-s7338}"
+RUN_DIR="${1:?output dir of the arm, e.g. output/iso/base-e768-d12/base-e768-d12-s7338}"
+case "$RUN_DIR" in output/*) ;; *) RUN_DIR="output/$RUN_DIR";; esac
 mkdir -p "${RUN_DIR}/eval" slurms
 
 export BRAINMARKS_SMRI_DATA=/data/brainmarks-smri

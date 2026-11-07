@@ -23,7 +23,7 @@ cd /admin/home/dojo/nanobrain-sweep
 CONFIG_REL="${1:?config path relative to configs/, e.g. iso/base-e768-d12}"
 SEED="${2:?seed}"
 NAME="$(basename "${CONFIG_REL}")-s${SEED}"
-RUN_DIR="output/${CONFIG_REL}/s${SEED}"
+RUN_DIR="output/${CONFIG_REL}/${NAME}"
 mkdir -p "${RUN_DIR}" slurms
 
 export BRAINMARKS_SMRI_DATA=/data/brainmarks-smri
@@ -47,8 +47,7 @@ uv run --no-sync python -m brainmarks_smri vit_mae_3d open \
     --overrides \
     "imports=[nanobrain.model]" \
     model_kwargs.checkpoint="${RUN_DIR}/checkpoint-last.pth" \
-    
-    output_dir="${RUN_DIR}" \
+    output_dir="${RUN_DIR}/eval" \
     name=eval
 
 echo "=== iso ${CONFIG_REL} s${SEED} done (train status ${status}) ==="
