@@ -259,6 +259,15 @@ def train(
     step = start_step
     done = False
 
+    # progressive masking (visible-ramp): linear ramp of the visible-patch count over the
+    # schedule, from visible_ramp_start at step 0 to visible_ramp_end at total_steps.
+    # falls back to the constant num_visible when unset.
+    if args.get("visible_ramp_start") is not None:
+        visible_ramp = (args.visible_ramp_start, args.visible_ramp_end or args.num_visible)
+    else:
+        visible_ramp = None
+    cur_num_visible = visible_ramp[0] if visible_ramp else args.num_visible
+
     optimizer.zero_grad()
 
     batches = metric_logger.log_every(
@@ -272,6 +281,9 @@ def train(
         need_update = (batch_idx + 1) % args.accum_iter == 0
         log_step = (batch_idx + 1) % print_freq_batches == 0
         lr = float(lr_schedule[step])
+        if visible_ramp:
+            frac = min(1.0, (batch_idx + 1 - start_batch) / max(1, num_batches - start_batch))
+            cur_num_visible = int(round(visible_ramp[0] + (visible_ramp[1] - visible_ramp[0]) * frac))
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -287,7 +299,7 @@ def train(
             loss = model(
                 images,
                 masks,
-                num_visible=args.num_visible,
+                num_visible=cur_num_visible,
                 num_predict=args.num_predict,
                 num_samples=args.num_samples,
                 with_state=False,

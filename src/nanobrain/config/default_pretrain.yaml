@@ -23,6 +23,11 @@ patch_size: 8
 num_visible: 640
 num_predict: 1920
 num_samples: 2
+# Progressive masking (optional): linear ramp of the visible-patch count over the run, from
+# visible_ramp_start at step 0 to visible_ramp_end at total_steps. num_visible is used when
+# visible_ramp_start is null.
+visible_ramp_start: null
+visible_ramp_end: null
 
 # Model (ViT-B encoder).
 model_kwargs:
