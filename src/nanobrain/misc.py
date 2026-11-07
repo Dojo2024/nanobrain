@@ -13,8 +13,10 @@ import os
 import random
 import subprocess
 import sys
+import tarfile
 import time
 from collections import defaultdict, deque
+from typing import Any
 from omegaconf import OmegaConf
 from pathlib import Path
 
@@ -787,3 +789,33 @@ def setup_logging(logger: logging.Logger, log_path: Path | None = None) -> None:
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
         logger.addHandler(handler)
     logger.propagate = False
+
+
+def git_info(path: Path = Path(__file__).parent) -> dict[str, Any] | None:
+    """Commit, branch, dirty state and origin of the git repo containing `path`."""
+    kwargs = dict(cwd=path, capture_output=True, text=True)
+    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kwargs)
+    if sha.returncode != 0:
+        return None
+    branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kwargs).stdout.strip()
+    status = subprocess.run(["git", "status", "--porcelain", "-uno"], **kwargs).stdout.strip()
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], **kwargs).stdout.strip()
+    return {
+        "sha": sha.stdout.strip(),
+        "branch": branch,
+        "dirty": bool(status),
+        "remote": remote or None,
+    }
+
+
+def snapshot_source(src_dir: Path, path: Path) -> None:
+    """Save `src_dir` as a .tar.gz archive at `path`, without python caches."""
+
+    def exclude_caches(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        name = Path(info.name).name
+        if name == "__pycache__" or name.endswith((".pyc", ".egg-info")):
+            return None
+        return info
+
+    with tarfile.open(path, "w:gz") as tar:
+        tar.add(src_dir, arcname=src_dir.name, filter=exclude_caches)

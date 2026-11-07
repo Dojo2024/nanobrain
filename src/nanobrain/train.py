@@ -66,6 +66,9 @@ def main(args: DictConfig):
     logger.info(f"sha: {misc.git_sha()}")
     logger.info(f"config:\n{OmegaConf.to_yaml(args)}")
 
+    # snapshot the source next to the run, for labless submission review
+    misc.snapshot_source(Path(__file__).resolve().parents[2] / "src", output_dir / "source.tar.gz")
+
     # data loader
     dataset = Fomo300kDataset(args.data_root, args.train_filelist)
     logger.info(f"train dataset: {len(dataset)} images")
@@ -173,6 +176,26 @@ def main(args: DictConfig):
 
         misc.save_model(args, epoch, model, optimizer, loss_scaler)
 
+        # updated every epoch so a wall-time kill (timeout, preemption) still leaves a
+        # current summary for the labless submit script
+        step = (epoch + 1) * len(train_loader)
+        summary = {
+            "step": step,
+            "images": step * args.accum_iter * args.batch_size,
+            "epochs": (epoch + 1),
+            "done": epoch + 1 >= args.epochs,
+            "final_loss": train_stats.get("train/loss"),
+            "num_params": num_params,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
+            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+            "cpus": len(os.sched_getaffinity(0)),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "git": misc.git_info(),
+        }
+        with (output_dir / "summary.json").open("w") as f:
+            json.dump(summary, f, indent=2)
+
     total_time = time.monotonic() - start_time
     logger.info(f"done! training time: {datetime.timedelta(seconds=int(total_time))}")
 
@@ -257,8 +280,9 @@ def train_one_epoch(
         if use_cuda:
             batch = misc.send_data(batch, device)
 
-        # run volume processing on gpu, not cpu workers
-        samples = [model.preprocess(decode_sample(sample)) for sample in batch]
+        # volume processing is split across the pipeline: decode_sample runs in the
+        # dataloader workers (parallel CPU), model.preprocess runs here on the gpu
+        samples = [model.preprocess(sample) for sample in batch]
         images = torch.stack([sample["image"] for sample in samples])
         masks = torch.stack([sample["mask"] for sample in samples])
         model_start = time.perf_counter()
@@ -368,7 +392,9 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
-        return sample
+        # decode in the workers (rle unpack, normalize, scatter): runs in parallel
+        # with gpu compute, so the main process only does h2d copy + preprocess
+        return decode_sample(sample)
 
 
 def decode_sample(sample: dict) -> dict:
