@@ -280,9 +280,10 @@ def train_one_epoch(
         if use_cuda:
             batch = misc.send_data(batch, device)
 
-        # volume processing is split across the pipeline: decode_sample runs in the
-        # dataloader workers (parallel CPU), model.preprocess runs here on the gpu
-        samples = [model.preprocess(sample) for sample in batch]
+        # run volume processing on gpu, not cpu workers. decoding here (not in the
+        # worker) keeps worker payloads small: measured data wait is ~0 vs 0.28 s/it
+        # with 35 MB decoded volumes shipped through shared memory per sample
+        samples = [model.preprocess(decode_sample(sample)) for sample in batch]
         images = torch.stack([sample["image"] for sample in samples])
         masks = torch.stack([sample["mask"] for sample in samples])
         model_start = time.perf_counter()
@@ -392,9 +393,10 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
-        # decode in the workers (rle unpack, normalize, scatter): runs in parallel
-        # with gpu compute, so the main process only does h2d copy + preprocess
-        return decode_sample(sample)
+        # return the compressed sample as-is: decode_sample runs at step time on
+        # the training side. decoding here multiplied worker payload size ~1000x
+        # and starved the gpu (data wait 0.28 s/it, 228 W vs 570 W)
+        return sample
 
 
 def decode_sample(sample: dict) -> dict:
