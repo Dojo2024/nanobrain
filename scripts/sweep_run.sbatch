@@ -47,7 +47,7 @@ uv run --no-sync python -m brainmarks_smri vit_mae_3d open \
     --overrides \
     "imports=[nanobrain.model]" \
     model_kwargs.checkpoint="${RUN_DIR}/checkpoint-last.pth" \
-    model_kwargs.readout_layers=null \
+    
     output_dir="${RUN_DIR}" \
     name=eval
 
