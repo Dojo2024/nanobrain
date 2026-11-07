@@ -65,8 +65,18 @@ class ViTMAE3D(nn.Module):
         level_weight: float = 0.0,
         level_thresholds: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5),
         level_pool: int = 2,
+        # the nanobrain-v3 loss stack, grafted from v3/src/nanobrain/model.py:
+        # z-score each target sequence before the mse; foreground-weighted mse; and the
+        # xyz gradient penalty on the target-ref patches (dense_neighbor_pool needs
+        # encoder plumbing and is not part of this graft)
+        norm_target: bool = False,
+        grad_loss_weight: float = 0.0,
+        fg_loss_weight: float = 0.0,
     ):
         super().__init__()
+        self.norm_target = norm_target
+        self.grad_loss_weight = float(grad_loss_weight)
+        self.fg_loss_weight = float(fg_loss_weight)
         self.grid_size = grid_size
         self.target_spacing = target_spacing
         self.native = native
@@ -361,7 +371,52 @@ class ViTMAE3D(nn.Module):
         target_mask_patches = target_mask_patches.to(target_patches.dtype)
         embeds = self.forward_encoder(vis_patches, vis_coord)
         pred_patches = self.forward_decoder(embeds, target_coord)
-        loss = F.mse_loss(pred_patches, target_patches, reduction="none")
+        # graft: the v3 loss stack. norm_target z-scores each target sequence; the
+        # mse and the gradient penalty run on target_ref, the fg mask weights the mse
+        if self.norm_target:
+            mean = target_patches.mean(dim=-1, keepdim=True)
+            var = target_patches.var(dim=-1, keepdim=True)
+            target_ref = (target_patches - mean) / (var + 1e-6) ** 0.5
+        else:
+            target_ref = target_patches
+        loss = F.mse_loss(pred_patches, target_ref, reduction="none")
+        if self.fg_loss_weight > 0.0:
+            fg_mask = (target_patches.abs() > 0.05).float()
+            fg_weights = 1.0 + self.fg_loss_weight * fg_mask
+            loss = (target_mask_patches * fg_weights * loss).sum() / (target_mask_patches * fg_weights).sum().clamp(min=1.0)
+        else:
+            loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
+        if self.grad_loss_weight > 0.0:
+            p = self.patch_size[0]
+            BM = pred_patches.shape[0] * pred_patches.shape[1]
+            pred_vol = pred_patches.reshape(BM, p, p, p)
+            tgt_vol = target_ref.reshape(BM, p, p, p)
+            mask_vol = target_mask_patches.reshape(BM, p, p, p)
+            dx_loss = F.mse_loss(
+                pred_vol[:, 1:, :, :] - pred_vol[:, :-1, :, :],
+                tgt_vol[:, 1:, :, :] - tgt_vol[:, :-1, :, :],
+                reduction="none",
+            )
+            dy_loss = F.mse_loss(
+                pred_vol[:, :, 1:, :] - pred_vol[:, :, :-1, :],
+                tgt_vol[:, :, 1:, :] - tgt_vol[:, :, :-1, :],
+                reduction="none",
+            )
+            dz_loss = F.mse_loss(
+                pred_vol[:, :, :, 1:] - pred_vol[:, :, :, :-1],
+                tgt_vol[:, :, :, 1:] - tgt_vol[:, :, :, :-1],
+                reduction="none",
+            )
+            mx = mask_vol[:, 1:, :, :] * mask_vol[:, :-1, :, :]
+            my = mask_vol[:, :, 1:, :] * mask_vol[:, :, :-1, :]
+            mz = mask_vol[:, :, :, 1:] * mask_vol[:, :, :, :-1]
+            grad_loss = (
+                (mx * dx_loss).sum() / mx.sum().clamp(min=1.0)
+                + (my * dy_loss).sum() / my.sum().clamp(min=1.0)
+                + (mz * dz_loss).sum() / mz.sum().clamp(min=1.0)
+            ) / 3.0
+            loss = loss + self.grad_loss_weight * grad_loss
+
         if self.hard_gamma:
             vox = target_mask_patches.sum(-1)
             tok = (target_mask_patches * loss).sum(-1) / vox.clamp_min(1)
@@ -507,19 +562,48 @@ class ViTMAE3D(nn.Module):
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         feats = self.decode_features(embeds, cat("target_coord"))
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
-        preds, targets, weights = [], [], []
+        # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
+        # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
+        # weights the mse per voxel, and the xyz gradient penalty runs per group on its own
+        # patch geometry; the global loss is the weight-masked mean across groups
+        losses, wts = [], []
+        grad_num, grad_den = [], []
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
             part["pred_patches"] = pred
-            preds.append(pred)
-            targets.append(part["target_patches"])
-            # mean over each token's voxels
-            weights.append(part["target_mask_patches"] / pred.shape[-1])
-        # all groups' voxels in one loss
-        weights = flat_cat(weights)
-        loss = F.mse_loss(flat_cat(preds), flat_cat(targets), reduction="none")
-        loss = (weights * loss).sum() / weights.sum()
+            px, py, pz = part["patch"]
+            tgt = part["target_patches"]
+            if self.norm_target:
+                tgt = (tgt - tgt.mean(dim=-1, keepdim=True)) / (tgt.var(dim=-1, keepdim=True) + 1e-6) ** 0.5
+            mse = F.mse_loss(pred, tgt, reduction="none")
+            mask = part["target_mask_patches"]
+            w = mask / pred.shape[-1]
+            if self.fg_loss_weight > 0.0:
+                fg_w = 1.0 + self.fg_loss_weight * (part["target_patches"].abs() > 0.05).to(w.dtype)
+                w = w * fg_w
+            losses.append((w * mse).flatten())
+            wts.append(w.flatten())
+            if self.grad_loss_weight > 0.0:
+                BM = pred.shape[0] * pred.shape[1]
+                pv = pred.reshape(BM, px, py, pz)
+                tv = tgt.reshape(BM, px, py, pz)
+                mv = mask.reshape(BM, px, py, pz).to(w.dtype)
+                dx = F.mse_loss(pv[:, 1:], tv[:, 1:] - tv[:, :-1], reduction="none")
+                dy = F.mse_loss(pv[:, :, 1:], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
+                dz = F.mse_loss(pv[:, :, :, 1:], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
+                mx = mv[:, 1:] * mv[:, :-1]
+                my = mv[:, :, 1:] * mv[:, :, :-1]
+                mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
+                grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
+                grad_den += [mx.sum(), my.sum(), mz.sum()]
+        loss = flat_cat(losses).sum() / flat_cat(wts).sum()
+        if self.grad_loss_weight > 0.0:
+            loss = loss + self.grad_loss_weight * (
+                grad_num[0] / grad_den[0].clamp_min(1.0)
+                + grad_num[1] / grad_den[1].clamp_min(1.0)
+                + grad_num[2] / grad_den[2].clamp_min(1.0)
+            ) / 3.0
         # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
