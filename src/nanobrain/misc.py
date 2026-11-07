@@ -794,17 +794,25 @@ def setup_logging(logger: logging.Logger, log_path: Path | None = None) -> None:
 def git_info(path: Path = Path(__file__).parent) -> dict[str, Any] | None:
     """Commit, branch, dirty state and origin of the git repo containing `path`."""
     kwargs = dict(cwd=path, capture_output=True, text=True)
-    sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kwargs)
+    # full sha: labless resolves short hashes through github search, which misses
+    # commits on non-default branches, then rejects the submission
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], **kwargs)
     if sha.returncode != 0:
         return None
     branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **kwargs).stdout.strip()
     status = subprocess.run(["git", "status", "--porcelain", "-uno"], **kwargs).stdout.strip()
-    remote = subprocess.run(["git", "remote", "get-url", "origin"], **kwargs).stdout.strip()
+    # no 'origin' in this checkout: fall back to the first remote, in URL form
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], **kwargs)
+    if remote.returncode != 0:
+        names = subprocess.run(["git", "remote"], **kwargs).stdout.split()
+        remote = subprocess.run(["git", "remote", "get-url", names[0]], **kwargs) if names else None
+    if remote is not None and remote.returncode != 0:
+        remote = None
     return {
         "sha": sha.stdout.strip(),
         "branch": branch,
         "dirty": bool(status),
-        "remote": remote or None,
+        "remote": remote.stdout.strip() if remote is not None else None,
     }
 
 
