@@ -9,11 +9,7 @@ cd /admin/home/dojo/nanobrain-sweep
 
 # jobs already alive from the pre-rename launch: base-e768-d12 s7338/s1, heads16-e768-d12 s7338
 SKIP="
-heads16-e768-d12|1
-heads8-e768-d12|7338
-heads8-e768-d12|1
-mask-nv1152|7338
-mask-nv1152|1
+"
 
 n_cfg=$(ls configs/iso/*.yaml | wc -l)
 echo "iso-flop sweep: $n_cfg configs x 2 seeds = $(( n_cfg * 2 )) runs (skipping live ones)"
