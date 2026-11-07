@@ -73,6 +73,12 @@ rampup)       EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
 ns3)          EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035 num_samples=3 ) ;;
 # muon x2 tracked better than champ at ep4 (0.70 vs 0.72); give it a completing schedule too
 muonx2a)      EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
+# --- seg-focused screening ---
+# dense decode: predict 2x the patches - denser reconstruction signal for the seg probes;
+# only the decoder grows (~1.6x), est ~0.125 s/it so 9 annealing epochs fit the hour
+champdense)   EXTRA=( epochs=9 warmup_epochs=2 base_lr=0.0035 num_predict=1280 ) ;;
+# foreground re-weight sweep: seg probes read tissue features
+fg05)         EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 model_kwargs.fg_loss_weight=0.5 ) ;;
 *)            echo "unknown arm ${ARM}" >&2; exit 2 ;;
 esac
 
