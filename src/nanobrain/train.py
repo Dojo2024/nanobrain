@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import os
+import signal
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -28,6 +30,10 @@ from nanobrain.visualization import plot_mask_pred
 logger = logging.getLogger()
 
 DEFAULT_CONFIG = Path(__file__).parent / "config/default_pretrain.yaml"
+
+# live training progress, shared with the SIGTERM handler so a wall-time kill
+# still writes an accurate summary (steps, flops, wall time) for submission
+_progress = {"batches": 0, "epoch": 0, "loss": None}
 
 
 def main(args: DictConfig):
@@ -157,6 +163,44 @@ def main(args: DictConfig):
 
     logger.info(f"start training for {args.epochs} epochs")
     start_time = time.monotonic()
+    _progress.update(batches=args.start_epoch * epoch_num_batches, epoch=args.start_epoch, loss=None)
+    stopped_by_signal = {"flag": False}
+
+    def write_summary() -> None:
+        # written per epoch and on SIGTERM so a wall-time kill (timeout, preemption)
+        # still leaves a current summary for the labless submit script
+        step = _progress["batches"]
+        summary = {
+            "step": step,
+            "images": step * args.accum_iter * args.batch_size,
+            "epochs": _progress["epoch"],
+            "done": _progress["epoch"] >= args.epochs and not stopped_by_signal["flag"],
+            "final_loss": _progress["loss"],
+            "num_params": num_params,
+            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
+            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+            "cpus": len(os.sched_getaffinity(0)),
+            "num_gpus": 1,
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "git": misc.git_info(),
+            "start_step": int(args.start_epoch) * epoch_num_batches,
+            "train_flops": batch_flops * step,
+            "wall_seconds": time.monotonic() - start_time,
+            "stopped_by_signal": stopped_by_signal["flag"],
+        }
+        with (output_dir / "summary.json").open("w") as f:
+            json.dump(summary, f, indent=2)
+
+    def _sigterm(signum, frame):
+        # timeout --kill-after / cluster preemption: record the interruption, then exit
+        stopped_by_signal["flag"] = True
+        logger.info("stopping on SIGTERM, writing summary")
+        write_summary()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _sigterm)
+
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
             args,
@@ -173,28 +217,11 @@ def main(args: DictConfig):
         merged_stats = {"epoch": epoch, **train_stats}
         with (output_dir / "log.json").open("a") as f:
             print(json.dumps(merged_stats), file=f)
-
         misc.save_model(args, epoch, model, optimizer, loss_scaler)
 
-        # updated every epoch so a wall-time kill (timeout, preemption) still leaves a
-        # current summary for the labless submit script
-        step = (epoch + 1) * len(train_loader)
-        summary = {
-            "step": step,
-            "images": step * args.accum_iter * args.batch_size,
-            "epochs": (epoch + 1),
-            "done": epoch + 1 >= args.epochs,
-            "final_loss": train_stats.get("train/loss"),
-            "num_params": num_params,
-            "peak_memory_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else 0,
-            "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
-            "cpus": len(os.sched_getaffinity(0)),
-            "torch": torch.__version__,
-            "cuda": torch.version.cuda,
-            "git": misc.git_info(),
-        }
-        with (output_dir / "summary.json").open("w") as f:
-            json.dump(summary, f, indent=2)
+        # per-epoch summary carries the epoch mean; mid-epoch SIGTERM carries the last logged loss
+        _progress["loss"] = train_stats.get("train/loss")
+        write_summary()
 
     total_time = time.monotonic() - start_time
     logger.info(f"done! training time: {datetime.timedelta(seconds=int(total_time))}")
@@ -269,6 +296,8 @@ def train_one_epoch(
         group_size = min(args.accum_iter, num_batches - update_in_epoch * args.accum_iter)
         need_update = batch_step % args.accum_iter == 0 or batch_step == num_batches
         global_step = epoch * steps_per_epoch + update_in_epoch
+        _progress["batches"] = epoch * num_batches + batch_step
+        _progress["epoch"] = epoch + 1
         lr = lr_schedule[global_step]
         if visible_ramp_start is not None:
             p = min(1.0, global_step / max(1, total_steps_sched))
@@ -299,6 +328,9 @@ def train_one_epoch(
             )
 
         loss_for_log = loss.detach()
+        # value read (syncing) only on log steps, like the meter
+        if log_step:
+            _progress["loss"] = float(loss_for_log)
         torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
 
         grad_norm = misc.backward_step(
