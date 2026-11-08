@@ -51,7 +51,13 @@ def main(args: DictConfig):
     out_cfg_path = output_dir / "config.yaml"
     if out_cfg_path.exists():
         prev_cfg = OmegaConf.load(out_cfg_path)
-        assert args == prev_cfg, "current config doesn't match previous config"
+        # allow resume with a changed schedule length (epochs); anything else must match
+        diff = {k for k in set(args) | set(prev_cfg) if args.get(k) != prev_cfg.get(k)}
+        assert diff <= {"epochs", "name", "notes"}, (
+            f"current config differs from previous in {sorted(diff)}")
+        args.epochs = args.epochs  # keep new value
+        logger.warning(f"resuming with changed keys: {sorted(diff)}")
+        OmegaConf.save(args, out_cfg_path)
     else:
         OmegaConf.save(args, out_cfg_path)
 
