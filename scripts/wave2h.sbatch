@@ -46,26 +46,27 @@ COMMON=(
 )
 
 case "${ARM}" in
-mx2-w1152)     EXTRA=( epochs=9  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 ) ;;
-mx2-w1152an)   EXTRA=( epochs=8  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 ) ;;
-mx2-w1152seg)  EXTRA=( epochs=8  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
+mx2-w1152)     EXTRA=( epochs=11   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 ) ;;
+mx2-w1152an)   EXTRA=( epochs=11   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 ) ;;
+mx2-w1152seg)  EXTRA=( epochs=10   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
                  model_kwargs.decoder_depth=2 model_kwargs.decoder_embed_dim=384 model_kwargs.decoder_num_heads=6
                  cooldown_epochs=1 cooldown_num_visible=1280 ) ;;
-mx2-anseg)     EXTRA=( epochs=13 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0
+mx2-anseg)     EXTRA=( epochs=14  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0
                  model_kwargs.decoder_depth=2 model_kwargs.decoder_embed_dim=384 model_kwargs.decoder_num_heads=6
                  cooldown_epochs=1 cooldown_num_visible=1280 ) ;;
-full)          EXTRA=( epochs=8  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
+full)          EXTRA=( epochs=10   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
                  model_kwargs.decoder_depth=2 model_kwargs.decoder_embed_dim=384 model_kwargs.decoder_num_heads=6
                  cooldown_epochs=1 cooldown_num_visible=1280 ) ;;
-mx2-w1152cd)   EXTRA=( epochs=7  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 num_predict=1280 ) ;;
-mx2-w1152fg)   EXTRA=( epochs=9  warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
+mx2-w1152cd)   EXTRA=( epochs=13   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152 num_predict=1280 ) ;;
+mx2-w1152fg)   EXTRA=( epochs=12   warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 model_kwargs.embed_dim=1152
                  model_kwargs.fg_loss_weight=0.5 ) ;;
 mx2a)          EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
 *)             echo "unknown arm ${ARM}" >&2; exit 2 ;;
 esac
 
 status=0
-timeout --kill-after=2m "60m" \
+TRAIN_CAP="${TRAIN_CAP:-75m}"
+timeout --kill-after=2m "${TRAIN_CAP}" \
     .venv/bin/python -m nanobrain.train \
     --overrides name="${NAME}" output_dir=output "${COMMON[@]}" "${EXTRA[@]}" \
     || status=$?

@@ -55,35 +55,35 @@ w1152)        EXTRA=( epochs=12 warmup_epochs=2 base_lr=0.0035 model_kwargs.embe
 champ-muonx2) EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
 speedchamp)   EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0032
                   batch_size=64 accum_iter=1 num_samples=4 num_predict=1280 ) ;;
-anneal)       EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 ) ;;
+anneal)       EXTRA=( epochs=12 warmup_epochs=2 base_lr=0.0035 ) ;;
 rampdown)     EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
                   visible_ramp_start=1024 visible_ramp_end=384 ) ;;
 champ2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 ); TRAIN_CAP="120m" ;;
 muonx2h)      EXTRA=( epochs=23 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ); TRAIN_CAP="120m" ;;
 # --- next screening wave (2 seeds each) ---
 # leader's data recipe (qc-filtered filelist) on our model; clip_quantiles already our default
-champqc)      EXTRA=( epochs=15 warmup_epochs=2 base_lr=0.0035
+champqc)      EXTRA=( epochs=17 warmup_epochs=2 base_lr=0.0035
                   train_filelist=src/nanobrain/config/fomo300k_images_qc.txt ) ;;
 # width axis with a schedule that completes inside the hour (measured ~0.12 s/it, <~10 epochs fit)
-w1152a)       EXTRA=( epochs=9 warmup_epochs=2 base_lr=0.0035 model_kwargs.embed_dim=1152 ) ;;
+w1152a)       EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 model_kwargs.embed_dim=1152 ) ;;
 # opposite curriculum: harder task first
 rampup)       EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035
                   visible_ramp_start=384 visible_ramp_end=1024 ) ;;
 # one extra sample sequence per image (richer steps at 1.5x cost; bs64/ns4 OOM'd)
-ns3)          EXTRA=( epochs=8 warmup_epochs=2 base_lr=0.0035 num_samples=3 ) ;;
+ns3)          EXTRA=( epochs=10 warmup_epochs=2 base_lr=0.0035 num_samples=3 ) ;;
 # muon x2 tracked better than champ at ep4 (0.70 vs 0.72); give it a completing schedule too
-muonx2a)      EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
+muonx2a)      EXTRA=( epochs=12 warmup_epochs=2 base_lr=0.0035 muon_lr_mult=2.0 ) ;;
 # --- seg-focused screening ---
 # dense decode: predict 2x the patches - denser reconstruction signal for the seg probes;
 # only the decoder grows (~1.6x), est ~0.125 s/it so 9 annealing epochs fit the hour
-champdense)   EXTRA=( epochs=9 warmup_epochs=2 base_lr=0.0035 num_predict=1280 ) ;;
+champdense)   EXTRA=( epochs=11warmup_epochs=2 base_lr=0.0035 num_predict=1280 ) ;;
 # foreground re-weight sweep: seg probes read tissue features
-fg05)         EXTRA=( epochs=11 warmup_epochs=2 base_lr=0.0035 model_kwargs.fg_loss_weight=0.5 ) ;;
+fg05)         EXTRA=( epochs=12 warmup_epochs=2 base_lr=0.0035 model_kwargs.fg_loss_weight=0.5 ) ;;
 *)            echo "unknown arm ${ARM}" >&2; exit 2 ;;
 esac
 
 # training cap, in minutes (timeout exits 124 when it stops training: expected)
-TRAIN_CAP="${TRAIN_CAP:-60m}"
+TRAIN_CAP="${TRAIN_CAP:-75m}"
 status=0
 timeout --kill-after=2m "${TRAIN_CAP}" \
     .venv/bin/python -m nanobrain.train \
